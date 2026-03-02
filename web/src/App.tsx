@@ -19,6 +19,9 @@ interface Session {
   summary_provider?: string;
   summary_status?: string;
   message_count: number;
+  native_session_id?: string | null;
+  resume_command?: string;
+  resume_label?: string;
 }
 
 interface SyncState {
@@ -275,6 +278,7 @@ export function App() {
   const [syncState, setSyncState] = useState<SyncState | null>(null);
   const [searching, setSearching] = useState(false);
   const [syncDetailOpen, setSyncDetailOpen] = useState(false);
+  const [copiedSessionId, setCopiedSessionId] = useState<string | null>(null);
   const syncRunning = Boolean(syncState?.running);
 
   async function fetchSummarySettings() {
@@ -592,6 +596,20 @@ export function App() {
     });
   }
 
+  async function copyResumeCommand(session: Session) {
+    const command = (session.resume_command ?? "").trim();
+    if (!command) return;
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopiedSessionId(session.id);
+      window.setTimeout(() => {
+        setCopiedSessionId((prev) => (prev === session.id ? null : prev));
+      }, 1200);
+    } catch {
+      setError("复制失败：请检查浏览器剪贴板权限。");
+    }
+  }
+
   return (
     <div className="app">
       <header className="topbar">
@@ -772,6 +790,24 @@ export function App() {
                       {session.summary_provider ?? "rule"}
                       {session.summary_status?.startsWith("fallback_rule") ? " (fallback)" : ""}
                     </div>
+                    {(session.resume_command ?? "").trim().length > 0 && (
+                      <div className="resume-row">
+                        <code className="resume-command" title={session.resume_command}>
+                          {session.resume_command?.split("\n")[0]}
+                        </code>
+                        <button
+                          type="button"
+                          className="resume-copy-btn"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            void copyResumeCommand(session);
+                          }}
+                        >
+                          {copiedSessionId === session.id ? "已复制" : session.resume_label ?? "复制"}
+                        </button>
+                      </div>
+                    )}
                   </>
                 );
               })()}

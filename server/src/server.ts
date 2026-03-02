@@ -11,6 +11,60 @@ const AUTO_SYNC_INTERVAL_MS = 60 * 60 * 1000;
 
 await app.register(cors, { origin: true });
 
+type SessionRow = {
+  id: string;
+  tool: "codex" | "claude" | "copilot" | "gemini" | string;
+  source_path: string;
+  [key: string]: unknown;
+};
+
+function extractNativeSessionId(tool: string, id: string, sourcePath: string): string | null {
+  if (tool === "codex") {
+    const m = sourcePath.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    return m?.[0] ?? null;
+  }
+  const prefixed = id.match(/^[^:]+:(.+)$/);
+  if (!prefixed) return null;
+  const tail = prefixed[1];
+  if (tool === "claude" || tool === "copilot") return tail;
+  if (tool === "gemini") {
+    const parts = tail.split(":");
+    return parts[parts.length - 1] ?? null;
+  }
+  return null;
+}
+
+function buildResumeHint(tool: string, nativeSessionId: string | null): { command: string; label: string } {
+  if (tool === "codex" && nativeSessionId) {
+    return { command: `codex resume ${nativeSessionId}`, label: "Resume" };
+  }
+  if (tool === "claude" && nativeSessionId) {
+    return { command: `claude --resume ${nativeSessionId}`, label: "Resume" };
+  }
+  if (tool === "copilot" && nativeSessionId) {
+    return { command: `copilot` + "\n" + `/resume ${nativeSessionId}`, label: "Open + /resume" };
+  }
+  if (tool === "gemini") {
+    return { command: "gemini --list-sessions", label: "List sessions" };
+  }
+  return { command: "", label: "" };
+}
+
+function withResumeHint(row: SessionRow): SessionRow & {
+  native_session_id: string | null;
+  resume_command: string;
+  resume_label: string;
+} {
+  const nativeSessionId = extractNativeSessionId(row.tool, row.id, String(row.source_path ?? ""));
+  const hint = buildResumeHint(row.tool, nativeSessionId);
+  return {
+    ...row,
+    native_session_id: nativeSessionId,
+    resume_command: hint.command,
+    resume_label: hint.label,
+  };
+}
+
 app.get("/api/health", async () => ({ ok: true, dbPath: getDbPath() }));
 
 app.post("/api/sync", async () => {
@@ -83,11 +137,11 @@ app.get("/api/sessions", async (request) => {
       .prepare(
         `SELECT * FROM sessions s WHERE 1=1 ${toolClause} ORDER BY datetime(start_time) DESC LIMIT ? OFFSET ?`
       )
-      .all(...toolFilters, pageSize, offset);
+      .all(...toolFilters, pageSize, offset) as SessionRow[];
     const total = db
       .prepare(`SELECT COUNT(*) as c FROM sessions s WHERE 1=1 ${toolClause}`)
       .get(...toolFilters) as { c: number };
-    return { items: rows, total: total.c };
+    return { items: rows.map(withResumeHint), total: total.c };
   }
 
   const roleFilter = scope === "question" ? "AND f.role = 'user'" : scope === "answer" ? "AND f.role = 'assistant'" : "";
@@ -105,7 +159,7 @@ app.get("/api/sessions", async (request) => {
       LIMIT ? OFFSET ?
     `
     )
-    .all(...queryParams);
+    .all(...queryParams) as SessionRow[];
 
   const total = db
     .prepare(
@@ -118,7 +172,7 @@ app.get("/api/sessions", async (request) => {
     )
     .get(...totalParams) as { c: number };
 
-  return { items: rows, total: total.c };
+  return { items: rows.map(withResumeHint), total: total.c };
 });
 
 app.get("/api/session", async (request, reply) => {
