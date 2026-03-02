@@ -275,6 +275,7 @@ export function App() {
   const [syncState, setSyncState] = useState<SyncState | null>(null);
   const [searching, setSearching] = useState(false);
   const [syncDetailOpen, setSyncDetailOpen] = useState(false);
+  const syncRunning = Boolean(syncState?.running);
 
   async function fetchSummarySettings() {
     try {
@@ -410,6 +411,9 @@ export function App() {
       }
       const startData = (await response.json()) as SyncStartResponse;
       setSyncState(startData.state);
+      if (!startData.started && startData.state.running) {
+        return;
+      }
       if (!startData.started && !startData.state.running) {
         throw new Error("sync task was not started");
       }
@@ -438,6 +442,9 @@ export function App() {
       }
       const startData = (await response.json()) as SyncStartResponse;
       setSyncState(startData.state);
+      if (!startData.started && startData.state.running) {
+        return;
+      }
       if (!startData.started && !startData.state.running) {
         throw new Error("reindex task was not started");
       }
@@ -502,6 +509,22 @@ export function App() {
   useEffect(() => {
     void fetchSummarySettings();
     void fetchSyncStatus();
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = async () => {
+      if (stopped) return;
+      const state = await fetchSyncStatus();
+      if (stopped) return;
+      timer = setTimeout(tick, state?.running ? 1000 : 5000);
+    };
+    void tick();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
   }, []);
 
   useEffect(() => {
@@ -576,11 +599,11 @@ export function App() {
           <h1>Chat Archive</h1>
           <div className="toolbar-actions">
             <button onClick={() => setSummaryPanelOpen((v) => !v)}>{summaryPanelOpen ? "关闭主题提炼" : "主题提炼设置"}</button>
-            <button onClick={() => void syncNow()} disabled={syncing || reindexing}>
-              {syncing ? "Syncing..." : "Sync"}
+            <button onClick={() => void syncNow()} disabled={syncing || reindexing || syncRunning}>
+              {syncRunning ? "Syncing..." : "Sync"}
             </button>
-            <button onClick={() => void reindexAll()} disabled={syncing || reindexing}>
-              {reindexing ? "Reindexing..." : "Reindex All"}
+            <button onClick={() => void reindexAll()} disabled={syncing || reindexing || syncRunning}>
+              {reindexing ? "Reindexing..." : syncRunning ? "Syncing..." : "Reindex All"}
             </button>
           </div>
         </div>

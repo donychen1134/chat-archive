@@ -39,6 +39,7 @@ const state: SyncTaskState = {
 
 let workerProcess: ReturnType<typeof spawn> | null = null;
 const EVENT_PREFIX = "__SYNC_EVENT__";
+const DEFAULT_SYNC_TASK_TIMEOUT_MS = Number(process.env.SYNC_TASK_TIMEOUT_MS ?? String(30 * 60 * 1000));
 
 function spawnSyncWorker(mode: SyncMode): ReturnType<typeof spawn> {
   const currentFile = fileURLToPath(import.meta.url);
@@ -122,15 +123,45 @@ export function startSyncTask(mode: SyncMode): { started: boolean; state: SyncTa
 
   let stdoutBuffer = "";
   let finished = false;
+  let timeoutId: NodeJS.Timeout | null = null;
+  let killId: NodeJS.Timeout | null = null;
 
   const markFailed = (message: string) => {
     if (finished) return;
     finished = true;
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+    if (killId) {
+      clearTimeout(killId);
+      killId = null;
+    }
     state.lastError = message;
     state.running = false;
     state.finishedAt = new Date().toISOString();
     state.currentFile = "";
   };
+
+  if (DEFAULT_SYNC_TASK_TIMEOUT_MS > 0) {
+    timeoutId = setTimeout(() => {
+      if (finished) return;
+      try {
+        workerProcess?.kill("SIGTERM");
+        killId = setTimeout(() => {
+          if (finished) return;
+          try {
+            workerProcess?.kill("SIGKILL");
+          } catch {
+            // Ignore kill errors.
+          }
+        }, 5000);
+      } catch {
+        // Ignore kill errors.
+      }
+      markFailed(`sync timeout after ${Math.floor(DEFAULT_SYNC_TASK_TIMEOUT_MS / 1000)}s`);
+    }, DEFAULT_SYNC_TASK_TIMEOUT_MS);
+  }
 
   workerProcess.stdout?.on("data", (chunk: Buffer | string) => {
     stdoutBuffer += chunk.toString();
@@ -148,6 +179,14 @@ export function startSyncTask(mode: SyncMode): { started: boolean; state: SyncTa
           applyProgress(event.progress);
         } else if (event.type === "done") {
           finished = true;
+          if (timeoutId) {
+            clearTimeout(timeoutId);
+            timeoutId = null;
+          }
+          if (killId) {
+            clearTimeout(killId);
+            killId = null;
+          }
           applyFinal(event.stats);
         } else if (event.type === "error") {
           markFailed(event.error || "sync worker failed");
@@ -170,6 +209,14 @@ export function startSyncTask(mode: SyncMode): { started: boolean; state: SyncTa
 
   workerProcess.on("close", (code) => {
     workerProcess = null;
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+    if (killId) {
+      clearTimeout(killId);
+      killId = null;
+    }
     if (finished) return;
     if (code === 0) {
       state.running = false;

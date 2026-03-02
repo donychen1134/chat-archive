@@ -7,6 +7,7 @@ import { getSyncTaskState, startSyncTask } from "./sync-manager.js";
 
 const app = Fastify({ logger: false });
 const port = Number(process.env.PORT ?? 8765);
+const AUTO_SYNC_INTERVAL_MS = 60 * 60 * 1000;
 
 await app.register(cors, { origin: true });
 
@@ -153,5 +154,13 @@ app.listen({ port, host: "127.0.0.1" }).then(() => {
         console.error("startup sync failed:", error);
       }
     }, 0);
+
+    setInterval(() => {
+      try {
+        startSyncTask("sync");
+      } catch (error) {
+        console.error("scheduled sync failed:", error);
+      }
+    }, AUTO_SYNC_INTERVAL_MS);
   }
 });
