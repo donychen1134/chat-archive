@@ -1,0 +1,19 @@
+{
+  "name": "chat-archive",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local CLI chat archive MVP",
+  "scripts": {
+    "dev": "npm-run-all --parallel dev:server dev:web",
+    "dev:server": "npm --prefix server run dev",
+    "dev:web": "npm --prefix web run dev",
+    "build": "npm-run-all build:server build:web",
+    "build:server": "npm --prefix server run build",
+    "build:web": "npm --prefix web run build",
+    "sync": "npm --prefix server run sync",
+    "ui": "npm --prefix server run dev"
+  },
+  "devDependencies": {
+    "npm-run-all": "^4.1.5"
+  }
+}
