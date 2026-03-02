@@ -614,9 +614,19 @@ export function App() {
     <div className="app">
       <header className="topbar">
         <div className="topbar-row">
-          <h1>Chat Archive</h1>
+          <div className="brand">
+            <span className="brand-mark" aria-hidden="true">
+              <span className="brand-dot" />
+            </span>
+            <h1>Chat Archive</h1>
+          </div>
           <div className="toolbar-actions">
-            <button onClick={() => setSummaryPanelOpen((v) => !v)}>{summaryPanelOpen ? "关闭主题提炼" : "主题提炼设置"}</button>
+            <button
+              className={`summary-launch-btn ${summaryPanelOpen ? "active" : ""}`}
+              onClick={() => setSummaryPanelOpen((v) => !v)}
+            >
+              {summaryPanelOpen ? "关闭主题设置" : "主题提炼设置"}
+            </button>
             <button onClick={() => void syncNow()} disabled={syncing || reindexing || syncRunning}>
               {syncRunning ? "Syncing..." : "Sync"}
             </button>
@@ -681,37 +691,6 @@ export function App() {
             {searching || loading ? "搜索中..." : "Search"}
           </button>
         </div>
-        <div className="pager">
-          <div className="pager-row">
-            <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1}>
-              上一页
-            </button>
-            <span>
-              第 {page}/{totalPages} 页
-            </span>
-            <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages}>
-              下一页
-            </button>
-          </div>
-          <div className="pager-row">
-            <span>
-              显示 {currentStart}-{currentEnd} / {totalSessions}
-            </span>
-            <select
-              value={String(pageSize)}
-              onChange={(e) => {
-                const nextSize = Number(e.target.value);
-                setPageSize(nextSize);
-                setPage(1);
-              }}
-            >
-              <option value="10">10 / 页</option>
-              <option value="20">20 / 页</option>
-              <option value="50">50 / 页</option>
-              <option value="100">100 / 页</option>
-            </select>
-          </div>
-        </div>
         {error && <div className="error">{error}</div>}
       </header>
 
@@ -755,6 +734,37 @@ export function App() {
             </button>
           </div>
           <div className="tool-filter-tip">点击为单选；按 Cmd/Ctrl/Shift 点击可多选。</div>
+        </div>
+        <div className="pager sidebar-pager">
+          <div className="pager-row">
+            <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1}>
+              上一页
+            </button>
+            <span>
+              第 {page}/{totalPages} 页
+            </span>
+            <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages}>
+              下一页
+            </button>
+          </div>
+          <div className="pager-row">
+            <span>
+              显示 {currentStart}-{currentEnd} / {totalSessions}
+            </span>
+            <select
+              value={String(pageSize)}
+              onChange={(e) => {
+                const nextSize = Number(e.target.value);
+                setPageSize(nextSize);
+                setPage(1);
+              }}
+            >
+              <option value="10">10 / 页</option>
+              <option value="20">20 / 页</option>
+              <option value="50">50 / 页</option>
+              <option value="100">100 / 页</option>
+            </select>
+          </div>
         </div>
         <div className="session-list">
           {loading && <div className="hint">Loading...</div>}
@@ -895,7 +905,10 @@ export function App() {
         <div className="summary-drawer-mask" onClick={() => setSummaryPanelOpen(false)}>
           <aside className="summary-drawer" onClick={(e) => e.stopPropagation()}>
             <div className="summary-drawer-head">
-              <strong>主题提炼设置</strong>
+              <div>
+                <strong>主题提炼设置</strong>
+                <div className="summary-subtitle">配置 provider、模型和超时策略</div>
+              </div>
               <button onClick={() => setSummaryPanelOpen(false)}>关闭</button>
             </div>
             <div className="summary-panel summary-panel-plain">
@@ -928,16 +941,18 @@ export function App() {
                   onChange={(e) => setCodexLimitPerRun(Math.max(0, Number(e.target.value) || 0))}
                 />
               </div>
+              {summaryInfo && <div className="summary-info">{summaryInfo}</div>}
+              {summaryLastError && <div className="summary-error">最近失败: {summaryLastError}</div>}
+            </div>
+            <div className="summary-footer">
               <div className="summary-actions">
                 <button onClick={() => void saveSummarySettings()} disabled={summarySaving || summaryTesting}>
-                  {summarySaving ? "保存中..." : "保存"}
+                  {summarySaving ? "保存中..." : "保存设置"}
                 </button>
                 <button onClick={() => void testSummaryProvider()} disabled={summarySaving || summaryTesting}>
                   {summaryTesting ? "测试中..." : "测试 provider"}
                 </button>
               </div>
-              {summaryInfo && <div className="summary-info">{summaryInfo}</div>}
-              {summaryLastError && <div className="summary-error">最近失败: {summaryLastError}</div>}
             </div>
           </aside>
         </div>

@@ -97,7 +97,7 @@ function normalizeCodexError(detail: string): string {
 }
 
 function sanitizeTitle(value: string): string {
-  const line = value.split("\n").find((v) => v.trim().length > 0)?.trim() ?? "Untitled Session";
+  const line = value.split("\n").find((v) => v.trim().length > 0)?.trim() ?? "未命名会话";
   return line.length > 90 ? `${line.slice(0, 87)}...` : line;
 }
 
@@ -115,8 +115,8 @@ function parseMetadataObject(raw: string): { title: string; summary: string } | 
   const keywords = keywordsRaw.join(", ");
   const summary =
     summaryText && keywords
-      ? `${summaryText} | Keywords: ${keywords}`
-      : summaryText || (keywords ? `Keywords: ${keywords}` : "Auto summary is not available for this session.");
+      ? `${summaryText} | 关键词: ${keywords}`
+      : summaryText || (keywords ? `关键词: ${keywords}` : "暂未提炼出会话摘要。");
   return { title, summary };
 }
 
@@ -150,14 +150,14 @@ function buildQwenSummary(
   }
 
   const prompt = [
-    "You are generating metadata for a single coding chat session.",
-    "Return strict JSON only with keys: title, summary, keywords.",
-    "Rules:",
-    "- title: <= 80 chars, specific to user intent, no boilerplate.",
-    "- summary: 1 short sentence, concrete and topical.",
-    "- keywords: array of 3-5 topical terms; avoid generic words like skill/repo/prompt/instruction/code.",
-    "- Do not include markdown.",
-    "Session conversation:",
+    "你在为一个编程会话生成元信息。",
+    "只返回严格 JSON，键必须是：title, summary, keywords。",
+    "要求：",
+    "- title：不超过 80 字，聚焦用户真实意图，不要模板化措辞。",
+    "- summary：一句简短中文总结，具体、贴近主题。",
+    "- keywords：3-5 个关键词数组，优先中文；避免 skill/repo/prompt/instruction/code 等泛词。",
+    "- 不要返回 markdown。",
+    "会话内容：",
     content,
   ].join("\n");
 
@@ -165,7 +165,7 @@ function buildQwenSummary(
     model: normalizeQwenModel(model),
     temperature: 0.2,
     messages: [
-      { role: "system", content: "Output strict JSON only." },
+      { role: "system", content: "你只输出严格 JSON，且内容使用简体中文。" },
       { role: "user", content: prompt },
     ],
   });
@@ -247,14 +247,14 @@ function buildCodexSummary(
   const outFile = path.join(tmp, "last.txt");
 
   const prompt = [
-    "You are generating metadata for a single coding chat session.",
-    "Return strict JSON only with keys: title, summary, keywords.",
-    "Rules:",
-    "- title: <= 80 chars, specific to user intent, no boilerplate.",
-    "- summary: 1 short sentence, concrete and topical.",
-    "- keywords: array of 3-5 topical terms; avoid generic words like skill/repo/prompt/instruction/code.",
-    "- Do not include markdown.",
-    "Session conversation:",
+    "你在为一个编程会话生成元信息。",
+    "只返回严格 JSON，键必须是：title, summary, keywords。",
+    "要求：",
+    "- title：不超过 80 字，聚焦用户真实意图，不要模板化措辞。",
+    "- summary：一句简短中文总结，具体、贴近主题。",
+    "- keywords：3-5 个关键词数组，优先中文；避免 skill/repo/prompt/instruction/code 等泛词。",
+    "- 不要返回 markdown。",
+    "会话内容：",
     content,
   ].join("\n");
 
