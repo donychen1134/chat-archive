@@ -72,6 +72,16 @@ try {
 } catch {
   // Column may already exist.
 }
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN session_purpose TEXT NOT NULL DEFAULT ''`);
+} catch {
+  // Column may already exist.
+}
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN session_target TEXT NOT NULL DEFAULT ''`);
+} catch {
+  // Column may already exist.
+}
 
 export function nowIso(): string {
   return new Date().toISOString();

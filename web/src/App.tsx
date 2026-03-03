@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
@@ -24,6 +24,8 @@ interface Session {
   native_session_id?: string | null;
   resume_command?: string;
   resume_label?: string;
+  session_purpose?: string;
+  session_target?: string;
   hit_score?: number;
   hit_roles?: string;
   hit_excerpt?: string;
@@ -48,6 +50,16 @@ interface SyncStartResponse {
   ok: boolean;
   started: boolean;
   state: SyncState;
+}
+
+interface PurposeSettings {
+  ruleCodeReview: string;
+  ruleTroubleshooting: string;
+  ruleDevelopment: string;
+  ruleUnderstanding: string;
+  customRules: string;
+  noiseWords: string;
+  shortTargetMaxLen: number;
 }
 
 interface Message {
@@ -97,16 +109,6 @@ function formatTime(value: string): string {
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
 }
 
-function formatHitRoles(value?: string): string {
-  if (!value) return "";
-  return value
-    .split(",")
-    .map((v) => v.trim())
-    .filter(Boolean)
-    .map((v) => (v === "user" ? "提问" : v === "assistant" ? "回答" : v === "tool" ? "工具" : "系统"))
-    .join(" / ");
-}
-
 function parseCodeBlocks(content: string): Array<{ kind: "text" | "code"; value: string; lang?: string }> {
   const regex = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
   const result: Array<{ kind: "text" | "code"; value: string; lang?: string }> = [];
@@ -146,6 +148,19 @@ function firstMeaningfulLine(text: string): string {
     if (!isBoilerplate(line)) return line;
   }
   return lines[0] ?? "(No user prompt)";
+}
+
+function messageLooksBoilerplate(message: Message): boolean {
+  if (message.role !== "user" && message.role !== "assistant") return false;
+  const text = message.content.trim().toLowerCase();
+  if (!text) return true;
+  return (
+    text.startsWith("## skills") ||
+    text.startsWith("# skills") ||
+    text.startsWith("<instructions>") ||
+    text.includes("# agents.md instructions") ||
+    text.startsWith("<permissions instructions>")
+  );
 }
 
 function lineIsImageTag(line: string): boolean {
@@ -220,18 +235,10 @@ function dedupeAdjacent(messages: Message[]): ViewMessage[] {
   return result;
 }
 
-function MessageView({
-  message,
-  query,
-  isCurrentMatch,
-}: {
-  message: ViewMessage;
-  query: string;
-  isCurrentMatch: boolean;
-}) {
+function MessageView({ message, query }: { message: ViewMessage; query: string }) {
   const segments = useMemo(() => parseCodeBlocks(message.content), [message.content]);
   return (
-    <div className={`message message-${message.role} ${isCurrentMatch ? "message-current-match" : ""}`} id={`msg-${message.id}`}>
+    <div className={`message message-${message.role}`} id={`msg-${message.id}`}>
       <div className="message-head">
         <strong>{message.role}</strong>
         <span>{formatTime(message.ts)}</span>
@@ -268,9 +275,11 @@ function groupTurns(messages: ViewMessage[]): Map<number, ViewMessage[]> {
 }
 
 export function App() {
-  const [scope, setScope] = useState<Scope>("all");
+  const [searchScope, setSearchScope] = useState<Scope>("all");
   const [selectedTools, setSelectedTools] = useState<ToolFilter[]>(ALL_TOOLS);
-  const [query, setQuery] = useState("");
+  const [searchInput, setSearchInput] = useState("");
+  const [appliedScope, setAppliedScope] = useState<Scope>("all");
+  const [appliedQuery, setAppliedQuery] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
   const [totalSessions, setTotalSessions] = useState(0);
   const [page, setPage] = useState(1);
@@ -285,22 +294,30 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [serverOk, setServerOk] = useState<boolean | null>(null);
   const [showSystemAndTool, setShowSystemAndTool] = useState(false);
-  const [matchIndex, setMatchIndex] = useState(0);
-  const [currentMatchMessageId, setCurrentMatchMessageId] = useState<string | null>(null);
   const [summaryProvider, setSummaryProvider] = useState<"codex" | "qwen" | "rule" | "hybrid">("rule");
   const [summaryModel, setSummaryModel] = useState("gpt-5-codex");
   const [summaryTimeoutMs, setSummaryTimeoutMs] = useState(20000);
   const [codexLimitPerRun, setCodexLimitPerRun] = useState(8);
   const [summaryLastError, setSummaryLastError] = useState("");
   const [summaryInfo, setSummaryInfo] = useState<string>("");
-  const [summaryPanelOpen, setSummaryPanelOpen] = useState(false);
+  const [settingsDrawer, setSettingsDrawer] = useState<"summary" | "purpose" | null>(null);
   const [summarySaving, setSummarySaving] = useState(false);
   const [summaryTesting, setSummaryTesting] = useState(false);
+  const [purposeRuleCodeReview, setPurposeRuleCodeReview] = useState("");
+  const [purposeRuleTroubleshooting, setPurposeRuleTroubleshooting] = useState("");
+  const [purposeRuleDevelopment, setPurposeRuleDevelopment] = useState("");
+  const [purposeRuleUnderstanding, setPurposeRuleUnderstanding] = useState("");
+  const [purposeCustomRules, setPurposeCustomRules] = useState("");
+  const [purposeNoiseWords, setPurposeNoiseWords] = useState("");
+  const [purposeShortTargetMaxLen, setPurposeShortTargetMaxLen] = useState(12);
+  const [purposeSaving, setPurposeSaving] = useState(false);
+  const [purposeReclassifying, setPurposeReclassifying] = useState(false);
   const [syncState, setSyncState] = useState<SyncState | null>(null);
   const [searching, setSearching] = useState(false);
   const [syncDetailOpen, setSyncDetailOpen] = useState(false);
   const [copiedSessionId, setCopiedSessionId] = useState<string | null>(null);
   const [copiedWorkdir, setCopiedWorkdir] = useState(false);
+  const sessionsRequestRef = useRef<AbortController | null>(null);
   const syncRunning = Boolean(syncState?.running);
 
   async function fetchSummarySettings() {
@@ -323,6 +340,23 @@ export function App() {
       setSummaryLastError(data.settings.lastError ?? "");
     } catch {
       setSummaryInfo("后端不可用，无法读取提炼配置。");
+    }
+  }
+
+  async function fetchPurposeSettings() {
+    try {
+      const resp = await fetch("/api/purpose/settings");
+      if (!resp.ok) return;
+      const data = (await resp.json()) as { settings: PurposeSettings };
+      setPurposeRuleCodeReview(data.settings.ruleCodeReview ?? "");
+      setPurposeRuleTroubleshooting(data.settings.ruleTroubleshooting ?? "");
+      setPurposeRuleDevelopment(data.settings.ruleDevelopment ?? "");
+      setPurposeRuleUnderstanding(data.settings.ruleUnderstanding ?? "");
+      setPurposeCustomRules(data.settings.customRules ?? "");
+      setPurposeNoiseWords(data.settings.noiseWords ?? "");
+      setPurposeShortTargetMaxLen(data.settings.shortTargetMaxLen ?? 12);
+    } catch {
+      setSummaryInfo("后端不可用，无法读取会话目的配置。");
     }
   }
 
@@ -366,26 +400,95 @@ export function App() {
     }
   }
 
+  async function savePurposeSettings() {
+    setPurposeSaving(true);
+    try {
+      const resp = await fetch("/api/purpose/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ruleCodeReview: purposeRuleCodeReview,
+          ruleTroubleshooting: purposeRuleTroubleshooting,
+          ruleDevelopment: purposeRuleDevelopment,
+          ruleUnderstanding: purposeRuleUnderstanding,
+          customRules: purposeCustomRules,
+          noiseWords: purposeNoiseWords,
+          shortTargetMaxLen: purposeShortTargetMaxLen,
+        }),
+      });
+      if (!resp.ok) {
+        setSummaryInfo("保存会话目的配置失败");
+        return;
+      }
+      setSummaryInfo("会话目的配置已保存");
+      await fetchPurposeSettings();
+    } catch {
+      setSummaryInfo("后端不可用，会话目的配置保存失败。");
+    } finally {
+      setPurposeSaving(false);
+    }
+  }
+
+  async function reclassifyPurpose() {
+    setPurposeReclassifying(true);
+    try {
+      const resp = await fetch("/api/purpose/reclassify", { method: "POST" });
+      const data = (await resp.json()) as { ok?: boolean; total?: number; changed?: number };
+      if (!resp.ok || !data.ok) {
+        setSummaryInfo("重新生成分类失败");
+        return;
+      }
+      setSummaryInfo(`已重生成分类：更新 ${data.changed ?? 0}/${data.total ?? 0}`);
+      await fetchSessions();
+      if (selected) {
+        await fetchSessionDetail(selected);
+      }
+    } catch {
+      setSummaryInfo("后端不可用，重新生成分类失败。");
+    } finally {
+      setPurposeReclassifying(false);
+    }
+  }
+
   async function fetchSessions() {
+    sessionsRequestRef.current?.abort();
+    const controller = new AbortController();
+    sessionsRequestRef.current = controller;
     try {
       setLoading(true);
       setError(null);
-      const params = new URLSearchParams({ scope, page: String(page), pageSize: String(pageSize) });
+      const params = new URLSearchParams({ scope: appliedScope, page: String(page), pageSize: String(pageSize) });
       if (selectedTools.length > 0 && selectedTools.length < ALL_TOOLS.length) {
         params.set("tools", selectedTools.join(","));
       }
-      if (query.trim()) params.set("query", query.trim());
-      const response = await fetch(`/api/sessions?${params.toString()}`);
+      if (appliedQuery.trim()) params.set("query", appliedQuery.trim());
+      const response = await fetch(`/api/sessions?${params.toString()}`, { signal: controller.signal });
+      if (sessionsRequestRef.current !== controller) return;
       if (!response.ok) {
         setServerOk(true);
+        if (response.status === 400) {
+          const data = (await response.json().catch(() => ({ error: "搜索语法不合法" }))) as { error?: string };
+          setError(data.error ?? "搜索语法不合法");
+          setSessions([]);
+          setTotalSessions(0);
+          return;
+        }
         if (response.status >= 500) {
           setError("后端正在处理任务或数据库忙，请稍后重试。");
+          if (appliedQuery.trim()) {
+            setSessions([]);
+            setTotalSessions(0);
+            setSelected(null);
+            setSessionDetail(null);
+            setMessages([]);
+          }
         } else {
           setError(`读取会话失败: HTTP ${response.status}`);
         }
         return;
       }
       const data = (await response.json()) as { items: Session[]; total: number };
+      if (sessionsRequestRef.current !== controller) return;
       setSessions(data.items);
       setTotalSessions(data.total);
       if (data.items.length > 0) {
@@ -393,13 +496,23 @@ export function App() {
         if (!hasSelected) {
           setSelected(data.items[0].id);
         }
+      } else {
+        setSelected(null);
+        setSessionDetail(null);
+        setMessages([]);
       }
       setServerOk(true);
-    } catch {
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return;
+      }
       setServerOk(false);
       setError("无法连接后端服务，请确认 server 已启动（127.0.0.1:8765）。");
     } finally {
-      setLoading(false);
+      if (sessionsRequestRef.current === controller) {
+        sessionsRequestRef.current = null;
+        setLoading(false);
+      }
     }
   }
 
@@ -527,15 +640,32 @@ export function App() {
 
   useEffect(() => {
     void fetchSessions();
-  }, [scope, selectedTools, page, pageSize]);
+  }, [appliedScope, appliedQuery, selectedTools, page, pageSize]);
 
   useEffect(() => {
     if (!loading) setSearching(false);
   }, [loading]);
 
   useEffect(() => {
+    if (!error) return;
+    if (!syncState?.running && serverOk) {
+      const lower = error.toLowerCase();
+      if (lower.includes("数据库忙") || lower.includes("后端正在处理任务")) {
+        setError(null);
+      }
+    }
+  }, [error, syncState?.running, serverOk]);
+
+  useEffect(() => {
     void fetchSummarySettings();
+    void fetchPurposeSettings();
     void fetchSyncStatus();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      sessionsRequestRef.current?.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -562,50 +692,53 @@ export function App() {
     void fetchSessionDetail(selected);
   }, [selected]);
 
+  const allMessages = useMemo(() => dedupeAdjacent(messages), [messages]);
+  const systemToolMessageCount = useMemo(
+    () => allMessages.filter((m) => m.role === "system" || m.role === "tool").length,
+    [allMessages]
+  );
   const visibleMessages = useMemo(() => {
-    const base = dedupeAdjacent(messages);
+    const base = allMessages;
     if (showSystemAndTool) return base;
-    return base.filter((m) => m.role === "user" || m.role === "assistant");
-  }, [messages, showSystemAndTool]);
+    return base.filter((m) => (m.role === "user" || m.role === "assistant") && !messageLooksBoilerplate(m));
+  }, [allMessages, showSystemAndTool]);
 
   const turns = useMemo(() => groupTurns(visibleMessages), [visibleMessages]);
 
-  const matchedMessages = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return [] as ViewMessage[];
-    return visibleMessages.filter((m) => m.content.toLowerCase().includes(q));
-  }, [visibleMessages, query]);
-
   useEffect(() => {
-    setMatchIndex(0);
-    setCurrentMatchMessageId(null);
-  }, [selected, query]);
-
-  useEffect(() => {
-    const current = matchedMessages[matchIndex];
-    if (!current) return;
-    setCurrentMatchMessageId(current.id);
-    setCollapsedTurns((prev) => {
-      if (!prev.has(current.turn_index)) return prev;
-      const next = new Set(prev);
-      next.delete(current.turn_index);
-      return next;
-    });
-    const el = document.getElementById(`msg-${current.id}`);
-    el?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [matchedMessages, matchIndex]);
+    if (systemToolMessageCount === 0 && showSystemAndTool) {
+      setShowSystemAndTool(false);
+    }
+  }, [systemToolMessageCount, showSystemAndTool]);
 
   const totalPages = Math.max(1, Math.ceil(totalSessions / pageSize));
   const currentStart = totalSessions === 0 ? 0 : (page - 1) * pageSize + 1;
   const currentEnd = Math.min(totalSessions, page * pageSize);
 
   function runSearch() {
+    if (loading) return;
     setSearching(true);
-    if (page !== 1) {
-      setPage(1);
+    const nextQuery = searchInput.trim();
+    const nextScope = searchScope;
+    const changed = nextQuery !== appliedQuery || nextScope !== appliedScope;
+    if (page !== 1) setPage(1);
+    if (changed) {
+      setAppliedQuery(nextQuery);
+      setAppliedScope(nextScope);
       return;
     }
     void fetchSessions();
+  }
+
+  function clearSearch() {
+    const needReload = appliedQuery.length > 0;
+    setSearching(needReload);
+    setSearchInput("");
+    if (page !== 1) setPage(1);
+    setAppliedQuery("");
+    if (!needReload) {
+      setError(null);
+    }
   }
 
   function toggleTool(tool: ToolFilter, multi: boolean) {
@@ -650,6 +783,10 @@ export function App() {
     if (!selected) return null;
     return sessionDetail ?? sessions.find((item) => item.id === selected) ?? null;
   }, [selected, sessionDetail, sessions]);
+  const selectedSessionParsedSummary = useMemo(
+    () => parseSummary(selectedSession?.summary ?? ""),
+    [selectedSession?.summary]
+  );
 
   return (
     <div className="app">
@@ -663,10 +800,16 @@ export function App() {
           </div>
           <div className="toolbar-actions">
             <button
-              className={`summary-launch-btn ${summaryPanelOpen ? "active" : ""}`}
-              onClick={() => setSummaryPanelOpen((v) => !v)}
+              className={`summary-launch-btn ${settingsDrawer === "summary" ? "active" : ""}`}
+              onClick={() => setSettingsDrawer((v) => (v === "summary" ? null : "summary"))}
             >
-              {summaryPanelOpen ? "关闭主题设置" : "主题提炼设置"}
+              {settingsDrawer === "summary" ? "关闭主题设置" : "主题提炼设置"}
+            </button>
+            <button
+              className={`summary-launch-btn ${settingsDrawer === "purpose" ? "active" : ""}`}
+              onClick={() => setSettingsDrawer((v) => (v === "purpose" ? null : "purpose"))}
+            >
+              {settingsDrawer === "purpose" ? "关闭目的设置" : "会话目的设置"}
             </button>
             <button onClick={() => void syncNow()} disabled={syncing || reindexing || syncRunning}>
               {syncRunning ? "Syncing..." : "Sync"}
@@ -714,22 +857,25 @@ export function App() {
         )}
         <div className="top-search">
           <input
-            value={query}
+            value={searchInput}
             placeholder="Search"
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => setSearchInput(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter") {
                 runSearch();
               }
             }}
           />
-          <select value={scope} onChange={(e) => setScope(e.target.value as Scope)}>
+          <select value={searchScope} onChange={(e) => setSearchScope(e.target.value as Scope)}>
             <option value="question">提问内容</option>
             <option value="answer">回答内容</option>
             <option value="all">全文</option>
           </select>
           <button onClick={runSearch} disabled={searching || loading}>
             {searching || loading ? "搜索中..." : "Search"}
+          </button>
+          <button onClick={clearSearch} disabled={searching || loading || (!appliedQuery && !searchInput)}>
+            清空
           </button>
         </div>
         {error && <div className="error">{error}</div>}
@@ -816,40 +962,30 @@ export function App() {
               className={`session-item ${selected === session.id ? "active" : ""}`}
               onClick={() => setSelected(session.id)}
             >
-              {(() => {
-                const parsed = parseSummary(session.summary);
-                return (
-                  <>
-                    <div className="title">{session.title}</div>
-                    <div className="meta">
-                      <span className={`tool-badge tool-${session.tool}`}>
-                        {session.tool === "claude"
-                          ? "Claude Code"
-                          : session.tool === "codex"
-                            ? "Codex"
-                            : session.tool === "copilot"
-                              ? "Copilot"
-                              : session.tool === "gemini"
-                                ? "Gemini"
-                                : session.tool}
-                      </span>
-                      <span>{formatTime(session.start_time)}</span>
-                    </div>
-                    {parsed.headline && <div className="summary-headline">{parsed.headline}</div>}
-                    {parsed.keywords && <div className="summary-keywords">关键词：{parsed.keywords}</div>}
-                    <div className="summary-meta">
-                      {session.summary_provider ?? "rule"}
-                      {session.summary_status?.startsWith("fallback_rule") ? " (fallback)" : ""}
-                    </div>
-                    {query.trim() && session.hit_roles && (
-                      <div className="hit-roles">命中角色：{formatHitRoles(session.hit_roles)}</div>
-                    )}
-                    {query.trim() && session.hit_excerpt && (
-                      <div className="hit-excerpt">{highlightText(session.hit_excerpt, query)}</div>
-                    )}
-                  </>
-                );
-              })()}
+              <>
+                <div className="title">{session.title}</div>
+                <div className="meta">
+                  <span className={`tool-badge tool-${session.tool}`}>
+                    {session.tool === "claude"
+                      ? "Claude Code"
+                      : session.tool === "codex"
+                        ? "Codex"
+                        : session.tool === "copilot"
+                          ? "Copilot"
+                          : session.tool === "gemini"
+                            ? "Gemini"
+                            : session.tool}
+                  </span>
+                  <span>{formatTime(session.start_time)}</span>
+                </div>
+                <div className="session-tags">
+                  <span className="tag-purpose">{session.session_purpose ?? "问题咨询"}</span>
+                  <span className="tag-target" title={session.session_target}>{session.session_target ?? "会话主题"}</span>
+                </div>
+                {appliedQuery.trim() && session.hit_excerpt && (
+                  <div className="hit-excerpt">{highlightText(session.hit_excerpt, appliedQuery)}</div>
+                )}
+              </>
             </button>
           ))}
         </div>
@@ -877,6 +1013,29 @@ export function App() {
                   </div>
                   <div className="session-meta-grid">
                     <div className="session-meta-item">
+                      <span className="meta-key">会话目的 / 对象</span>
+                      <code className="meta-value">
+                        {(selectedSession.session_purpose ?? "问题咨询") + " / " + (selectedSession.session_target ?? "会话主题")}
+                      </code>
+                    </div>
+                    <div className="session-meta-item">
+                      <span className="meta-key">会话总结</span>
+                      <code className="meta-value">{selectedSessionParsedSummary.headline || selectedSession.summary}</code>
+                    </div>
+                    {selectedSessionParsedSummary.keywords && (
+                      <div className="session-meta-item">
+                        <span className="meta-key">关键词</span>
+                        <code className="meta-value">{selectedSessionParsedSummary.keywords}</code>
+                      </div>
+                    )}
+                    <div className="session-meta-item">
+                      <span className="meta-key">提炼来源</span>
+                      <code className="meta-value">
+                        {(selectedSession.summary_provider ?? "rule") +
+                          (selectedSession.summary_status?.startsWith("fallback_rule") ? " (fallback)" : "")}
+                      </code>
+                    </div>
+                    <div className="session-meta-item">
                       <span className="meta-key">工作目录</span>
                       <code className="meta-value" title={selectedSession.project ?? ""}>
                         {selectedSession.project && selectedSession.project.trim().length > 0
@@ -901,7 +1060,7 @@ export function App() {
                     )}
                     {(selectedSession.resume_command ?? "").trim().length > 0 && (
                       <button onClick={() => void copyResumeCommand(selectedSession)}>
-                        {copiedSessionId === selectedSession.id ? "已复制" : selectedSession.resume_label ?? "复制 Resume"}
+                        {copiedSessionId === selectedSession.id ? "已复制" : "复制 Resume 命令"}
                       </button>
                     )}
                   </div>
@@ -914,26 +1073,16 @@ export function App() {
                   <input
                     type="checkbox"
                     checked={showSystemAndTool}
+                    disabled={systemToolMessageCount === 0}
                     onChange={(e) => setShowSystemAndTool(e.target.checked)}
                   />
-                  显示系统/工具消息
+                  显示系统/工具消息 ({systemToolMessageCount})
                 </label>
                 <span className="match-summary">
-                  命中 {matchedMessages.length}
-                  {matchedMessages.length > 0 ? ` (${matchIndex + 1}/${matchedMessages.length})` : ""}
+                  {appliedQuery.trim()
+                    ? `当前为“${appliedQuery}”的会话级搜索结果。`
+                    : "输入关键词并点击 Search，可按会话过滤结果。"}
                 </span>
-                <button
-                  onClick={() => setMatchIndex((i) => (matchedMessages.length ? (i - 1 + matchedMessages.length) % matchedMessages.length : 0))}
-                  disabled={matchedMessages.length === 0}
-                >
-                  上一个命中
-                </button>
-                <button
-                  onClick={() => setMatchIndex((i) => (matchedMessages.length ? (i + 1) % matchedMessages.length : 0))}
-                  disabled={matchedMessages.length === 0}
-                >
-                  下一个命中
-                </button>
               </div>
               <div className="turns">
                 {turns.size === 0 && <div className="hint">该会话暂无可显示消息</div>}
@@ -953,9 +1102,7 @@ export function App() {
                         }}
                       >
                         <span>Turn {turnIndex}</span>
-                        <span className="turn-question" title={userQuestion}>
-                          {highlightText(userQuestion, query)}
-                        </span>
+                        <span className="turn-question" title={userQuestion}>{userQuestion}</span>
                       </button>
                       {!collapsed && (
                         <div className="turn-body">
@@ -963,8 +1110,7 @@ export function App() {
                             <MessageView
                               key={message.id}
                               message={message}
-                              query={query}
-                              isCurrentMatch={currentMatchMessageId === message.id}
+                              query=""
                             />
                           ))}
                         </div>
@@ -978,59 +1124,127 @@ export function App() {
         </main>
       </div>
 
-      {summaryPanelOpen && (
-        <div className="summary-drawer-mask" onClick={() => setSummaryPanelOpen(false)}>
+      {settingsDrawer && (
+        <div className="summary-drawer-mask" onClick={() => setSettingsDrawer(null)}>
           <aside className="summary-drawer" onClick={(e) => e.stopPropagation()}>
             <div className="summary-drawer-head">
               <div>
-                <strong>主题提炼设置</strong>
-                <div className="summary-subtitle">配置 provider、模型和超时策略</div>
+                <strong>{settingsDrawer === "summary" ? "主题提炼设置" : "会话目的设置"}</strong>
+                <div className="summary-subtitle">
+                  {settingsDrawer === "summary"
+                    ? "配置 provider、模型和超时策略"
+                    : "配置会话目的分类规则和 target 提取策略"}
+                </div>
               </div>
-              <button onClick={() => setSummaryPanelOpen(false)}>关闭</button>
+              <button onClick={() => setSettingsDrawer(null)}>关闭</button>
             </div>
-            <div className="summary-panel summary-panel-plain">
-              <div className="summary-row">
-                <span>Provider</span>
-                <select value={summaryProvider} onChange={(e) => setSummaryProvider(e.target.value as "codex" | "qwen" | "rule" | "hybrid")}>
-                  <option value="qwen">qwen</option>
-                  <option value="hybrid">hybrid (推荐)</option>
-                  <option value="codex">codex (全量)</option>
-                  <option value="rule">rule</option>
-                </select>
-              </div>
-              <div className="summary-row">
-                <span>Model</span>
-                <input value={summaryModel} onChange={(e) => setSummaryModel(e.target.value)} />
-              </div>
-              <div className="summary-row">
-                <span>Timeout</span>
-                <input
-                  type="number"
-                  value={summaryTimeoutMs}
-                  onChange={(e) => setSummaryTimeoutMs(Number(e.target.value) || 20000)}
-                />
-              </div>
-              <div className="summary-row">
-                <span>Codex预算</span>
-                <input
-                  type="number"
-                  value={codexLimitPerRun}
-                  onChange={(e) => setCodexLimitPerRun(Math.max(0, Number(e.target.value) || 0))}
-                />
-              </div>
-              {summaryInfo && <div className="summary-info">{summaryInfo}</div>}
-              {summaryLastError && <div className="summary-error">最近失败: {summaryLastError}</div>}
-            </div>
-            <div className="summary-footer">
-              <div className="summary-actions">
-                <button onClick={() => void saveSummarySettings()} disabled={summarySaving || summaryTesting}>
-                  {summarySaving ? "保存中..." : "保存设置"}
-                </button>
-                <button onClick={() => void testSummaryProvider()} disabled={summarySaving || summaryTesting}>
-                  {summaryTesting ? "测试中..." : "测试 provider"}
-                </button>
-              </div>
-            </div>
+
+            {settingsDrawer === "summary" && (
+              <>
+                <div className="summary-panel summary-panel-plain">
+                  <div className="summary-row">
+                    <span>Provider</span>
+                    <select value={summaryProvider} onChange={(e) => setSummaryProvider(e.target.value as "codex" | "qwen" | "rule" | "hybrid")}>
+                      <option value="qwen">qwen</option>
+                      <option value="hybrid">hybrid (推荐)</option>
+                      <option value="codex">codex (全量)</option>
+                      <option value="rule">rule</option>
+                    </select>
+                  </div>
+                  <div className="summary-row">
+                    <span>Model</span>
+                    <input value={summaryModel} onChange={(e) => setSummaryModel(e.target.value)} />
+                  </div>
+                  <div className="summary-row">
+                    <span>Timeout</span>
+                    <input
+                      type="number"
+                      value={summaryTimeoutMs}
+                      onChange={(e) => setSummaryTimeoutMs(Number(e.target.value) || 20000)}
+                    />
+                  </div>
+                  <div className="summary-row">
+                    <span>Codex预算</span>
+                    <input
+                      type="number"
+                      value={codexLimitPerRun}
+                      onChange={(e) => setCodexLimitPerRun(Math.max(0, Number(e.target.value) || 0))}
+                    />
+                  </div>
+                  {summaryInfo && <div className="summary-info">{summaryInfo}</div>}
+                  {summaryLastError && <div className="summary-error">最近失败: {summaryLastError}</div>}
+                </div>
+                <div className="summary-footer">
+                  <div className="summary-actions">
+                    <button onClick={() => void saveSummarySettings()} disabled={summarySaving || summaryTesting}>
+                      {summarySaving ? "保存中..." : "保存设置"}
+                    </button>
+                    <button onClick={() => void testSummaryProvider()} disabled={summarySaving || summaryTesting}>
+                      {summaryTesting ? "测试中..." : "测试 provider"}
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {settingsDrawer === "purpose" && (
+              <>
+                <div className="summary-panel summary-panel-plain">
+                  <div className="summary-row">
+                    <span>代码评审</span>
+                    <input value={purposeRuleCodeReview} onChange={(e) => setPurposeRuleCodeReview(e.target.value)} />
+                  </div>
+                  <div className="summary-row">
+                    <span>问题排查</span>
+                    <input value={purposeRuleTroubleshooting} onChange={(e) => setPurposeRuleTroubleshooting(e.target.value)} />
+                  </div>
+                  <div className="summary-row">
+                    <span>功能开发</span>
+                    <input value={purposeRuleDevelopment} onChange={(e) => setPurposeRuleDevelopment(e.target.value)} />
+                  </div>
+                  <div className="summary-row">
+                    <span>代码理解</span>
+                    <input value={purposeRuleUnderstanding} onChange={(e) => setPurposeRuleUnderstanding(e.target.value)} />
+                  </div>
+                  <div className="summary-row">
+                    <span>自定义分类</span>
+                    <textarea
+                      className="summary-textarea"
+                      value={purposeCustomRules}
+                      onChange={(e) => setPurposeCustomRules(e.target.value)}
+                      placeholder={"每行一条：分类名=正则\n例如：性能优化=性能|benchmark|profile"}
+                    />
+                  </div>
+                  <div className="summary-row">
+                    <span>噪音词</span>
+                    <textarea
+                      className="summary-textarea"
+                      value={purposeNoiseWords}
+                      onChange={(e) => setPurposeNoiseWords(e.target.value)}
+                    />
+                  </div>
+                  <div className="summary-row">
+                    <span>短目标长度</span>
+                    <input
+                      type="number"
+                      value={purposeShortTargetMaxLen}
+                      onChange={(e) => setPurposeShortTargetMaxLen(Math.max(8, Math.min(48, Number(e.target.value) || 12)))}
+                    />
+                  </div>
+                  {summaryInfo && <div className="summary-info">{summaryInfo}</div>}
+                </div>
+                <div className="summary-footer">
+                  <div className="summary-actions">
+                    <button onClick={() => void savePurposeSettings()} disabled={purposeSaving || purposeReclassifying}>
+                      {purposeSaving ? "保存中..." : "保存会话目的"}
+                    </button>
+                    <button onClick={() => void reclassifyPurpose()} disabled={purposeSaving || purposeReclassifying}>
+                      {purposeReclassifying ? "重生成中..." : "重新生成分类"}
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
           </aside>
         </div>
       )}

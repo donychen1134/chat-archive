@@ -1,6 +1,7 @@
 import { db, nowIso } from "./db.js";
 
 export type SummaryProvider = "codex" | "qwen" | "rule" | "hybrid";
+export type PurposeKey = "code_review" | "troubleshooting" | "development" | "understanding" | "consulting";
 
 export interface SummarySettings {
   provider: SummaryProvider;
@@ -8,6 +9,16 @@ export interface SummarySettings {
   timeoutMs: number;
   codexLimitPerRun: number;
   lastError: string;
+}
+
+export interface PurposeSettings {
+  ruleCodeReview: string;
+  ruleTroubleshooting: string;
+  ruleDevelopment: string;
+  ruleUnderstanding: string;
+  customRules: string;
+  noiseWords: string;
+  shortTargetMaxLen: number;
 }
 
 const DEFAULTS: SummarySettings = {
@@ -22,6 +33,17 @@ const DEFAULTS: SummarySettings = {
   timeoutMs: Number(process.env.CHAT_ARCHIVE_SUMMARY_TIMEOUT_MS ?? "30000"),
   codexLimitPerRun: Number(process.env.CHAT_ARCHIVE_CODEX_LIMIT_PER_RUN ?? "8"),
   lastError: "",
+};
+
+const PURPOSE_DEFAULTS: PurposeSettings = {
+  ruleCodeReview:
+    "代码审查|代码评审|code review|review the code|review the current code|review the code changes|git diff|pull request|\\bpr\\b|merge base|staged|unstaged|code changes|变更评审|审查变更|审查代码",
+  ruleTroubleshooting: "排查|故障|报错|error|invalid|timeout|failed|panic|异常|修复|debug|诊断|定位",
+  ruleDevelopment: "实现|开发|重构|新增|优化|设计|build|feature|mvp|页面|ui|功能",
+  ruleUnderstanding: "分析|理解|解释|阅读|看懂|作用|原理|流程",
+  customRules: "",
+  noiseWords: "mt,.codex,codex,sessions,session,tmp,chats,users,user,home,src,go,github,projects,rollout",
+  shortTargetMaxLen: 12,
 };
 
 const getStmt = db.prepare("SELECT value FROM app_config WHERE key = ?");
@@ -94,4 +116,46 @@ export function setSummarySettings(input: Partial<SummarySettings>): SummarySett
 export function setSummaryLastError(message: string): void {
   const now = nowIso();
   upsertStmt.run("summary.last_error", message.slice(0, 500), now);
+}
+
+export function getPurposeSettings(): PurposeSettings {
+  return {
+    ruleCodeReview: getString("purpose.rule.code_review", PURPOSE_DEFAULTS.ruleCodeReview),
+    ruleTroubleshooting: getString("purpose.rule.troubleshooting", PURPOSE_DEFAULTS.ruleTroubleshooting),
+    ruleDevelopment: getString("purpose.rule.development", PURPOSE_DEFAULTS.ruleDevelopment),
+    ruleUnderstanding: getString("purpose.rule.understanding", PURPOSE_DEFAULTS.ruleUnderstanding),
+    customRules: getString("purpose.rule.custom", PURPOSE_DEFAULTS.customRules),
+    noiseWords: getString("purpose.noise_words", PURPOSE_DEFAULTS.noiseWords),
+    shortTargetMaxLen: getNumber("purpose.short_target_max_len", PURPOSE_DEFAULTS.shortTargetMaxLen),
+  };
+}
+
+export function setPurposeSettings(input: Partial<PurposeSettings>): PurposeSettings {
+  const current = getPurposeSettings();
+  const next: PurposeSettings = {
+    ruleCodeReview: input.ruleCodeReview?.trim() ? input.ruleCodeReview.trim() : current.ruleCodeReview,
+    ruleTroubleshooting: input.ruleTroubleshooting?.trim()
+      ? input.ruleTroubleshooting.trim()
+      : current.ruleTroubleshooting,
+    ruleDevelopment: input.ruleDevelopment?.trim() ? input.ruleDevelopment.trim() : current.ruleDevelopment,
+    ruleUnderstanding: input.ruleUnderstanding?.trim() ? input.ruleUnderstanding.trim() : current.ruleUnderstanding,
+    customRules: typeof input.customRules === "string" ? input.customRules.trim() : current.customRules,
+    noiseWords: typeof input.noiseWords === "string" ? input.noiseWords.trim() : current.noiseWords,
+    shortTargetMaxLen:
+      typeof input.shortTargetMaxLen === "number" &&
+      Number.isFinite(input.shortTargetMaxLen) &&
+      input.shortTargetMaxLen >= 8 &&
+      input.shortTargetMaxLen <= 48
+        ? Math.floor(input.shortTargetMaxLen)
+        : current.shortTargetMaxLen,
+  };
+  const now = nowIso();
+  upsertStmt.run("purpose.rule.code_review", next.ruleCodeReview, now);
+  upsertStmt.run("purpose.rule.troubleshooting", next.ruleTroubleshooting, now);
+  upsertStmt.run("purpose.rule.development", next.ruleDevelopment, now);
+  upsertStmt.run("purpose.rule.understanding", next.ruleUnderstanding, now);
+  upsertStmt.run("purpose.rule.custom", next.customRules, now);
+  upsertStmt.run("purpose.noise_words", next.noiseWords, now);
+  upsertStmt.run("purpose.short_target_max_len", String(next.shortTargetMaxLen), now);
+  return next;
 }
