@@ -140,25 +140,53 @@ function fileToSessionId(root: string, filePath: string): string {
   return `codex:${relative.replaceAll(path.sep, "/")}`;
 }
 
-function fileToProject(filePath: string): string | null {
+function extractProjectPath(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function projectFromRecord(record: Record<string, unknown>): string | null {
+  const direct = extractProjectPath(record.cwd ?? record.project);
+  if (direct) return direct;
+
+  const payload = record.payload;
+  if (payload && typeof payload === "object") {
+    const fromPayload = extractProjectPath((payload as Record<string, unknown>).cwd);
+    if (fromPayload) return fromPayload;
+  }
+
+  const context = record.context;
+  if (context && typeof context === "object") {
+    const fromContext = extractProjectPath((context as Record<string, unknown>).cwd);
+    if (fromContext) return fromContext;
+  }
+
   return null;
 }
 
-function parseFileMessages(filePath: string, stat: fs.Stats): MessageRecord[] {
+function parseFile(filePath: string, stat: fs.Stats): { project: string | null; messages: MessageRecord[] } {
   const raw = fs.readFileSync(filePath, "utf8");
   const lines = filePath.endsWith(".jsonl") ? raw.split(/\r?\n/).filter((l) => l.trim().length > 0) : [raw];
 
   const extracted: Array<{ role: ChatRole; ts: string; content: string }> = [];
+  let project: string | null = null;
   for (const line of lines) {
     try {
       const parsed = JSON.parse(line) as unknown;
       if (Array.isArray(parsed)) {
         for (const item of parsed) {
+          if (!project && item && typeof item === "object") {
+            project = projectFromRecord(item as Record<string, unknown>) ?? project;
+          }
           const msg = extractMessage(item, stat.mtime);
           if (msg) extracted.push(msg);
         }
       } else if (parsed && typeof parsed === "object") {
         const obj = parsed as Record<string, unknown>;
+        if (!project) {
+          project = projectFromRecord(obj) ?? project;
+        }
         const envelopeMessages = extractFromCodexEnvelope(obj, stat.mtime);
         if (envelopeMessages.length > 0) {
           extracted.push(...envelopeMessages);
@@ -198,7 +226,7 @@ function parseFileMessages(filePath: string, stat: fs.Stats): MessageRecord[] {
   let turn = 0;
   let prevRole: ChatRole | null = null;
   let prevUserContent = "";
-  return deduped.map((msg, idx) => {
+  const messages = deduped.map((msg, idx) => {
     if (msg.role === "user") {
       const isConsecutiveDuplicateUser = prevRole === "user" && prevUserContent === msg.content;
       if (!isConsecutiveDuplicateUser) {
@@ -219,6 +247,7 @@ function parseFileMessages(filePath: string, stat: fs.Stats): MessageRecord[] {
       seq_in_session: idx,
     };
   });
+  return { project, messages };
 }
 
 export function syncCodexSessions(onProgress?: (progress: SyncProgress) => void): SyncStats {
@@ -279,8 +308,9 @@ export function syncCodexSessions(onProgress?: (progress: SyncProgress) => void)
 
   const tx = db.transaction((filePath: string, stat: fs.Stats) => {
     const sessionId = fileToSessionId(root, filePath);
-    const project = fileToProject(filePath);
-    const messages = parseFileMessages(filePath, stat);
+    const parsed = parseFile(filePath, stat);
+    const project = parsed.project;
+    const messages = parsed.messages;
 
     if (messages.length === 0) {
       stats.warnings += 1;

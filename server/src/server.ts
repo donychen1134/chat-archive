@@ -34,17 +34,34 @@ function extractNativeSessionId(tool: string, id: string, sourcePath: string): s
   return null;
 }
 
-function buildResumeHint(tool: string, nativeSessionId: string | null): { command: string; label: string } {
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function buildResumeHint(
+  tool: string,
+  nativeSessionId: string | null,
+  project: string | null
+): { command: string; label: string } {
+  const projectPrefix =
+    project && project.trim().length > 0 ? `cd ${shellQuote(project)} && ` : "";
+
   if (tool === "codex" && nativeSessionId) {
-    return { command: `codex resume ${nativeSessionId}`, label: "Resume" };
+    return { command: `${projectPrefix}codex resume ${nativeSessionId}`, label: "Resume" };
   }
   if (tool === "claude" && nativeSessionId) {
-    return { command: `claude --resume ${nativeSessionId}`, label: "Resume" };
+    return { command: `${projectPrefix}claude --resume ${nativeSessionId}`, label: "Resume" };
   }
   if (tool === "copilot" && nativeSessionId) {
+    if (projectPrefix) {
+      return { command: `${projectPrefix}copilot` + "\n" + `/resume ${nativeSessionId}`, label: "Open + /resume" };
+    }
     return { command: `copilot` + "\n" + `/resume ${nativeSessionId}`, label: "Open + /resume" };
   }
   if (tool === "gemini") {
+    if (nativeSessionId) {
+      return { command: `${projectPrefix}gemini -r ${nativeSessionId}`, label: "Resume" };
+    }
     return { command: "gemini --list-sessions", label: "List sessions" };
   }
   return { command: "", label: "" };
@@ -56,7 +73,8 @@ function withResumeHint(row: SessionRow): SessionRow & {
   resume_label: string;
 } {
   const nativeSessionId = extractNativeSessionId(row.tool, row.id, String(row.source_path ?? ""));
-  const hint = buildResumeHint(row.tool, nativeSessionId);
+  const project = typeof row.project === "string" ? row.project : null;
+  const hint = buildResumeHint(row.tool, nativeSessionId, project);
   return {
     ...row,
     native_session_id: nativeSessionId,
@@ -151,11 +169,67 @@ app.get("/api/sessions", async (request) => {
   const rows = db
     .prepare(
       `
-      SELECT DISTINCT s.*
-      FROM sessions s
-      JOIN message_fts f ON f.session_id = s.id
-      WHERE f.content MATCH ? ${roleFilter} ${toolClause}
-      ORDER BY datetime(s.start_time) DESC
+      WITH matched AS (
+        SELECT
+          s.id AS session_id,
+          s.tool,
+          s.source_path,
+          s.project,
+          s.start_time,
+          s.end_time,
+          s.duration_sec,
+          s.title,
+          s.summary,
+          s.summary_provider,
+          s.summary_status,
+          s.message_count,
+          s.created_at,
+          s.updated_at,
+          f.role AS hit_role,
+          bm25(message_fts) AS hit_score,
+          snippet(message_fts, 3, '[', ']', ' … ', 14) AS hit_excerpt
+        FROM sessions s
+        JOIN message_fts f ON f.session_id = s.id
+        WHERE f.content MATCH ? ${roleFilter} ${toolClause}
+      )
+      SELECT
+        session_id AS id,
+        tool,
+        source_path,
+        project,
+        start_time,
+        end_time,
+        duration_sec,
+        title,
+        summary,
+        summary_provider,
+        summary_status,
+        message_count,
+        created_at,
+        updated_at,
+        MIN(hit_score) AS hit_score,
+        GROUP_CONCAT(DISTINCT hit_role) AS hit_roles,
+        COALESCE(
+          MAX(CASE WHEN hit_role = 'user' THEN hit_excerpt END),
+          MAX(hit_excerpt)
+        ) AS hit_excerpt
+      FROM matched
+      GROUP BY
+        session_id,
+        tool,
+        source_path,
+        project,
+        start_time,
+        end_time,
+        duration_sec,
+        title,
+        summary,
+        summary_provider,
+        summary_status,
+        message_count,
+        created_at,
+        updated_at
+      ORDER BY hit_score ASC, datetime(start_time) DESC
       LIMIT ? OFFSET ?
     `
     )
@@ -182,7 +256,8 @@ app.get("/api/session", async (request, reply) => {
     return { error: "Missing id" };
   }
 
-  const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(id);
+  const rawSession = db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as SessionRow | undefined;
+  const session = rawSession ? withResumeHint(rawSession) : null;
   if (!session) {
     reply.status(404);
     return { error: "Session not found" };

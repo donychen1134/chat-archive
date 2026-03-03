@@ -11,6 +11,8 @@ const ALL_TOOLS: ToolFilter[] = ["codex", "claude", "copilot", "gemini"];
 interface Session {
   id: string;
   tool: string;
+  source_path?: string;
+  project?: string | null;
   start_time: string;
   end_time: string;
   duration_sec: number;
@@ -22,6 +24,9 @@ interface Session {
   native_session_id?: string | null;
   resume_command?: string;
   resume_label?: string;
+  hit_score?: number;
+  hit_roles?: string;
+  hit_excerpt?: string;
 }
 
 interface SyncState {
@@ -52,6 +57,11 @@ interface Message {
   content: string;
   turn_index: number;
   seq_in_session: number;
+}
+
+interface SessionDetailResponse {
+  session: Session;
+  messages: Message[];
 }
 
 interface ViewMessage extends Message {
@@ -85,6 +95,16 @@ function parseSummary(summary: string): { headline: string; keywords: string } {
 function formatTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+}
+
+function formatHitRoles(value?: string): string {
+  if (!value) return "";
+  return value
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .map((v) => (v === "user" ? "提问" : v === "assistant" ? "回答" : v === "tool" ? "工具" : "系统"))
+    .join(" / ");
 }
 
 function parseCodeBlocks(content: string): Array<{ kind: "text" | "code"; value: string; lang?: string }> {
@@ -256,6 +276,7 @@ export function App() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [selected, setSelected] = useState<string | null>(null);
+  const [sessionDetail, setSessionDetail] = useState<Session | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [collapsedTurns, setCollapsedTurns] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(false);
@@ -279,6 +300,7 @@ export function App() {
   const [searching, setSearching] = useState(false);
   const [syncDetailOpen, setSyncDetailOpen] = useState(false);
   const [copiedSessionId, setCopiedSessionId] = useState<string | null>(null);
+  const [copiedWorkdir, setCopiedWorkdir] = useState(false);
   const syncRunning = Boolean(syncState?.running);
 
   async function fetchSummarySettings() {
@@ -392,7 +414,8 @@ export function App() {
         }
         return;
       }
-      const data = (await response.json()) as { messages: Message[] };
+      const data = (await response.json()) as SessionDetailResponse;
+      setSessionDetail(data.session);
       setMessages(data.messages);
 
       const turnIndexes = Array.from(new Set(data.messages.map((m) => m.turn_index))).sort((a, b) => a - b);
@@ -533,6 +556,9 @@ export function App() {
 
   useEffect(() => {
     if (!selected) return;
+    setCopiedWorkdir(false);
+    setSessionDetail(null);
+    setMessages([]);
     void fetchSessionDetail(selected);
   }, [selected]);
 
@@ -609,6 +635,21 @@ export function App() {
       setError("复制失败：请检查浏览器剪贴板权限。");
     }
   }
+
+  async function copyWorkdir(project: string) {
+    try {
+      await navigator.clipboard.writeText(project);
+      setCopiedWorkdir(true);
+      window.setTimeout(() => setCopiedWorkdir(false), 1200);
+    } catch {
+      setError("复制失败：请检查浏览器剪贴板权限。");
+    }
+  }
+
+  const selectedSession = useMemo(() => {
+    if (!selected) return null;
+    return sessionDetail ?? sessions.find((item) => item.id === selected) ?? null;
+  }, [selected, sessionDetail, sessions]);
 
   return (
     <div className="app">
@@ -800,23 +841,11 @@ export function App() {
                       {session.summary_provider ?? "rule"}
                       {session.summary_status?.startsWith("fallback_rule") ? " (fallback)" : ""}
                     </div>
-                    {(session.resume_command ?? "").trim().length > 0 && (
-                      <div className="resume-row">
-                        <code className="resume-command" title={session.resume_command}>
-                          {session.resume_command?.split("\n")[0]}
-                        </code>
-                        <button
-                          type="button"
-                          className="resume-copy-btn"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            void copyResumeCommand(session);
-                          }}
-                        >
-                          {copiedSessionId === session.id ? "已复制" : session.resume_label ?? "复制"}
-                        </button>
-                      </div>
+                    {query.trim() && session.hit_roles && (
+                      <div className="hit-roles">命中角色：{formatHitRoles(session.hit_roles)}</div>
+                    )}
+                    {query.trim() && session.hit_excerpt && (
+                      <div className="hit-excerpt">{highlightText(session.hit_excerpt, query)}</div>
                     )}
                   </>
                 );
@@ -830,6 +859,54 @@ export function App() {
           {!selected && <div className="empty">请选择一个会话</div>}
           {selected && (
             <>
+              {selectedSession && (
+                <section className="session-meta-card">
+                  <div className="session-meta-row">
+                    <span className={`tool-badge tool-${selectedSession.tool}`}>
+                      {selectedSession.tool === "claude"
+                        ? "Claude Code"
+                        : selectedSession.tool === "codex"
+                          ? "Codex"
+                          : selectedSession.tool === "copilot"
+                            ? "Copilot"
+                            : selectedSession.tool === "gemini"
+                              ? "Gemini"
+                              : selectedSession.tool}
+                    </span>
+                    <span className="meta-time">开始时间：{formatTime(selectedSession.start_time)}</span>
+                  </div>
+                  <div className="session-meta-grid">
+                    <div className="session-meta-item">
+                      <span className="meta-key">工作目录</span>
+                      <code className="meta-value" title={selectedSession.project ?? ""}>
+                        {selectedSession.project && selectedSession.project.trim().length > 0
+                          ? selectedSession.project
+                          : "未记录"}
+                      </code>
+                    </div>
+                    {(selectedSession.resume_command ?? "").trim().length > 0 && (
+                      <div className="session-meta-item">
+                        <span className="meta-key">Resume</span>
+                        <code className="meta-value" title={selectedSession.resume_command}>
+                          {selectedSession.resume_command}
+                        </code>
+                      </div>
+                    )}
+                  </div>
+                  <div className="session-meta-actions">
+                    {(selectedSession.project ?? "").trim().length > 0 && (
+                      <button onClick={() => void copyWorkdir((selectedSession.project ?? "").trim())}>
+                        {copiedWorkdir ? "目录已复制" : "复制工作目录"}
+                      </button>
+                    )}
+                    {(selectedSession.resume_command ?? "").trim().length > 0 && (
+                      <button onClick={() => void copyResumeCommand(selectedSession)}>
+                        {copiedSessionId === selectedSession.id ? "已复制" : selectedSession.resume_label ?? "复制 Resume"}
+                      </button>
+                    )}
+                  </div>
+                </section>
+              )}
               <div className="turn-toolbar">
                 <button onClick={() => setCollapsedTurns(new Set())}>展开全部</button>
                 <button onClick={() => setCollapsedTurns(new Set(Array.from(turns.keys())))}>折叠全部</button>
