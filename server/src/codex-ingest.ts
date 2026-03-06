@@ -250,9 +250,13 @@ function parseFile(filePath: string, stat: fs.Stats): { project: string | null; 
   return { project, messages };
 }
 
-export function syncCodexSessions(onProgress?: (progress: SyncProgress) => void): SyncStats {
+export function syncCodexSessions(
+  onProgress?: (progress: SyncProgress) => void,
+  options?: { onlyPaths?: Set<string> }
+): SyncStats {
   const root = codexSessionsDir();
-  const files = walkFiles(root);
+  const onlyPaths = options?.onlyPaths;
+  const files = walkFiles(root).filter((p) => !onlyPaths || onlyPaths.has(p));
   const settings = getSummarySettings();
   let codexBudget = settings.provider === "hybrid" ? settings.codexLimitPerRun : Number.MAX_SAFE_INTEGER;
 

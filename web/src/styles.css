@@ -171,8 +171,9 @@ button:disabled {
 }
 
 .top-search {
-  display: grid;
-  grid-template-columns: minmax(260px, 1fr) 190px 132px 96px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -190,6 +191,19 @@ button:disabled {
   font-size: 14px;
 }
 
+.top-search input {
+  flex: 1 1 420px;
+  min-width: 220px;
+}
+
+.top-search select {
+  flex: 0 0 140px;
+}
+
+.top-search button {
+  flex: 0 0 110px;
+}
+
 .pager {
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -204,9 +218,9 @@ button:disabled {
 .sidebar-pager {
   border: 0;
   border-top: 1px solid #e8deca;
-  border-bottom: 1px solid #e8deca;
   border-radius: 0;
-  background: #fbf8f0;
+  background: #fcfaf3;
+  padding: 7px 10px;
 }
 
 .pager-row {
@@ -214,6 +228,36 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+
+.sidebar-pager-row {
+  display: grid;
+  grid-template-columns: auto auto auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.pager-page-label {
+  min-width: 52px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.pager-count-label {
+  margin-left: auto;
+  font-size: 12px;
+  justify-self: end;
+  white-space: nowrap;
+}
+
+.sidebar-pager-row button {
+  padding: 6px 10px;
+  min-width: 74px;
+}
+
+.sidebar-pager-row select {
+  width: 92px;
+  padding: 7px 8px;
 }
 
 .error {
@@ -228,13 +272,14 @@ button:disabled {
 .content {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(340px, 390px) 1fr;
+  grid-template-columns: minmax(360px, 430px) minmax(0, 1fr);
   gap: 12px;
 }
 
 .sidebar,
 .main {
   min-height: 0;
+  min-width: 0;
   border: 1px solid var(--line);
   border-radius: 16px;
   background: var(--panel);
@@ -249,10 +294,17 @@ button:disabled {
 
 .tool-filter {
   border-bottom: 1px solid #e8deca;
-  padding: 10px;
+  padding: 8px 10px;
   display: grid;
-  gap: 8px;
+  gap: 6px;
   background: linear-gradient(180deg, #f8f3e7 0%, #f3faf8 100%);
+}
+
+.tool-filter-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
 }
 
 .tool-filter-title {
@@ -263,14 +315,14 @@ button:disabled {
 
 .tool-filter-actions {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   flex-wrap: wrap;
 }
 
 .tool-chip {
   border: 1px solid var(--line-strong);
   border-radius: 999px;
-  padding: 6px 12px;
+  padding: 5px 11px;
   background: #fff;
   font-size: 12px;
   font-weight: 700;
@@ -286,28 +338,35 @@ button:disabled {
 .tool-filter-tip {
   font-size: 11px;
   color: #73847f;
+  white-space: normal;
+  text-align: left;
+  line-height: 1.3;
 }
 
 .session-list {
-  padding: 10px;
-  overflow: auto;
+  padding: 10px 16px 10px 10px;
+  overflow-y: auto;
+  overflow-x: hidden;
   min-height: 0;
+  scrollbar-gutter: stable;
 }
 
 .session-item {
+  display: block;
   width: 100%;
+  max-width: 100%;
   text-align: left;
   border: 1px solid #e0d6c3;
   border-radius: 12px;
   background: #fff;
-  margin-bottom: 10px;
+  margin: 0 2px 10px 0;
   padding: 11px;
-  box-shadow: 0 5px 12px rgba(58, 49, 28, 0.05);
+  box-shadow: none;
 }
 
 .session-item.active {
   border-color: var(--primary);
-  box-shadow: 0 0 0 2px rgba(13, 124, 119, 0.2);
+  box-shadow: inset 0 0 0 2px rgba(13, 124, 119, 0.2);
 }
 
 .title {
@@ -324,6 +383,7 @@ button:disabled {
   justify-content: space-between;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .tool-badge {
@@ -782,7 +842,7 @@ button:disabled {
   }
 
   .content {
-    grid-template-columns: 320px 1fr;
+    grid-template-columns: minmax(340px, 390px) minmax(0, 1fr);
   }
 }
 
@@ -806,6 +866,36 @@ button:disabled {
   }
 
   .top-search {
+    display: grid;
     grid-template-columns: 1fr;
+  }
+
+  .tool-filter-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .tool-filter-tip {
+    white-space: normal;
+  }
+
+  .pager-count-label {
+    margin-left: 0;
+  }
+
+  .sidebar-pager-row {
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .pager-page-label,
+  .pager-count-label {
+    justify-self: start;
+    text-align: left;
+  }
+
+  .sidebar-pager-row select {
+    width: 100%;
   }
 }

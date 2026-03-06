@@ -291,6 +291,7 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [reindexing, setReindexing] = useState(false);
+  const [reindexingSessionId, setReindexingSessionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [serverOk, setServerOk] = useState<boolean | null>(null);
   const [showSystemAndTool, setShowSystemAndTool] = useState(false);
@@ -603,6 +604,32 @@ export function App() {
     }
   }
 
+  async function reindexSingleSession(sessionId: string) {
+    try {
+      setReindexingSessionId(sessionId);
+      setError(null);
+      const response = await fetch("/api/reindex/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId }),
+      });
+      const data = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      if (!response.ok || !data.ok) {
+        setError(`重建当前会话失败：${data.error ?? `HTTP ${response.status}`}`);
+        return;
+      }
+      await fetchSessions();
+      if (selected) {
+        await fetchSessionDetail(selected);
+      }
+    } catch (errorCaught) {
+      const detail = errorCaught instanceof Error ? errorCaught.message : String(errorCaught);
+      setError(`重建当前会话失败：${detail || "后端重建报错"}`);
+    } finally {
+      setReindexingSessionId(null);
+    }
+  }
+
   async function fetchSyncStatus(): Promise<SyncState | null> {
     try {
       const response = await fetch("/api/sync/status");
@@ -884,7 +911,9 @@ export function App() {
       <div className="content">
         <aside className="sidebar">
         <div className="tool-filter">
-          <div className="tool-filter-title">CLI 过滤</div>
+          <div className="tool-filter-head">
+            <div className="tool-filter-title">CLI 过滤</div>
+          </div>
           <div className="tool-filter-actions">
             <button
               className={`tool-chip ${selectedTools.length === ALL_TOOLS.length ? "active" : ""}`}
@@ -920,26 +949,25 @@ export function App() {
               Gemini
             </button>
           </div>
-          <div className="tool-filter-tip">点击为单选；按 Cmd/Ctrl/Shift 点击可多选。</div>
+          <div className="tool-filter-tip">单击单选，按 Cmd/Ctrl/Shift 可多选</div>
         </div>
         <div className="pager sidebar-pager">
-          <div className="pager-row">
+          <div className="pager-row sidebar-pager-row">
             <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1}>
               上一页
             </button>
-            <span>
-              第 {page}/{totalPages} 页
+            <span className="pager-page-label">
+              {page}/{totalPages}
             </span>
             <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages}>
               下一页
             </button>
-          </div>
-          <div className="pager-row">
-            <span>
-              显示 {currentStart}-{currentEnd} / {totalSessions}
+            <span className="pager-count-label">
+              {currentStart}-{currentEnd} / {totalSessions}
             </span>
             <select
               value={String(pageSize)}
+              aria-label="每页条数"
               onChange={(e) => {
                 const nextSize = Number(e.target.value);
                 setPageSize(nextSize);
@@ -1063,6 +1091,12 @@ export function App() {
                         {copiedSessionId === selectedSession.id ? "已复制" : "复制 Resume 命令"}
                       </button>
                     )}
+                    <button
+                      onClick={() => void reindexSingleSession(selectedSession.id)}
+                      disabled={syncing || reindexing || syncRunning || reindexingSessionId === selectedSession.id}
+                    >
+                      {reindexingSessionId === selectedSession.id ? "重建中..." : "重建当前会话"}
+                    </button>
                   </div>
                 </section>
               )}

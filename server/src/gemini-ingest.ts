@@ -150,9 +150,13 @@ function fileToSessionId(root: string, filePath: string, hint: string | null, pr
   return `gemini:${relative.replaceAll(path.sep, "/")}`;
 }
 
-export function syncGeminiSessions(onProgress?: (progress: SyncProgress) => void): SyncStats {
+export function syncGeminiSessions(
+  onProgress?: (progress: SyncProgress) => void,
+  options?: { onlyPaths?: Set<string> }
+): SyncStats {
   const root = geminiSessionsDir();
-  const files = walkGeminiFiles(root);
+  const onlyPaths = options?.onlyPaths;
+  const files = walkGeminiFiles(root).filter((p) => !onlyPaths || onlyPaths.has(p));
   const settings = getSummarySettings();
   let codexBudget = settings.provider === "hybrid" ? settings.codexLimitPerRun : Number.MAX_SAFE_INTEGER;
 

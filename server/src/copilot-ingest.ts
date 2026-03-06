@@ -152,9 +152,13 @@ function fileToSessionId(root: string, filePath: string, hint: string | null): s
   return `copilot:${relative.replaceAll(path.sep, "/")}`;
 }
 
-export function syncCopilotSessions(onProgress?: (progress: SyncProgress) => void): SyncStats {
+export function syncCopilotSessions(
+  onProgress?: (progress: SyncProgress) => void,
+  options?: { onlyPaths?: Set<string> }
+): SyncStats {
   const root = copilotSessionsDir();
-  const files = walkCopilotFiles(root);
+  const onlyPaths = options?.onlyPaths;
+  const files = walkCopilotFiles(root).filter((p) => !onlyPaths || onlyPaths.has(p));
   const settings = getSummarySettings();
   let codexBudget = settings.provider === "hybrid" ? settings.codexLimitPerRun : Number.MAX_SAFE_INTEGER;
 

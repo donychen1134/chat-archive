@@ -1,6 +1,10 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { db, getDbPath } from "./db.js";
+import { syncClaudeSessions } from "./claude-ingest.js";
+import { syncCodexSessions } from "./codex-ingest.js";
+import { syncCopilotSessions } from "./copilot-ingest.js";
+import { syncGeminiSessions } from "./gemini-ingest.js";
 import {
   getPurposeSettings,
   getSummarySettings,
@@ -210,11 +214,39 @@ function inferSessionPurposeAndTarget(row: SessionRow, settings: PurposeSettings
       .map((v) => v.trim().toLowerCase())
       .filter(Boolean)
   );
+  const builtinNoise = new Set([
+    "users",
+    "user",
+    "home",
+    "src",
+    "tmp",
+    "sessions",
+    "session",
+    "events",
+    "projects",
+    "project",
+    "workspace",
+    "workspaces",
+    "repos",
+    "repo",
+    "chat-archive",
+  ]);
   const normalize = (value: string): string => value.replace(/\s+/g, " ").trim();
+  const looksLikeUuid = (value: string): boolean =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  const looksLikeHash = (value: string): boolean =>
+    /^[0-9a-f]{16,}$/i.test(value) ||
+    /^([0-9a-f]{4,}[-_]){2,}[0-9a-f]{4,}$/i.test(value) ||
+    (/^[a-z0-9_-]{20,}$/i.test(value) && !/[aeiou]/i.test(value));
+  const looksLikeId = (value: string): boolean => looksLikeUuid(value) || looksLikeHash(value);
   const isNoise = (value: string): boolean => {
     const v = normalize(value).toLowerCase();
     if (!v || v.length < 2) return true;
     if (noiseWords.has(v)) return true;
+    if (builtinNoise.has(v)) return true;
+    if (looksLikeId(v)) return true;
+    if (/^[a-z]{1,3}$/i.test(v)) return true;
+    if (/^\d+$/.test(v)) return true;
     if (v.startsWith(".") && !v.includes("-") && !v.includes("_")) return true;
     return false;
   };
@@ -226,26 +258,103 @@ function inferSessionPurposeAndTarget(row: SessionRow, settings: PurposeSettings
     }
     return "";
   };
+  const extractEntityToken = (text: string): string => {
+    const tokenStop = new Set([
+      "session",
+      "summary",
+      "target",
+      "review",
+      "analysis",
+      "problem",
+      "issue",
+      "question",
+      "answer",
+      "prompt",
+      "default",
+      "latest",
+      "current",
+      "system",
+      "assistant",
+      "user",
+      "message",
+      "messages",
+    ]);
+    const asciiTokens = (text.match(/[A-Za-z][A-Za-z0-9._-]{2,}/g) ?? []).filter((raw) => {
+      const v = raw.trim();
+      if (!v) return false;
+      if (isNoise(v)) return false;
+      if (looksLikeId(v)) return false;
+      if (tokenStop.has(v.toLowerCase())) return false;
+      return true;
+    });
+    if (asciiTokens.length > 0) {
+      let best = asciiTokens[0];
+      let bestScore = -1;
+      for (const token of asciiTokens) {
+        let score = 0;
+        if (/[A-Z]/.test(token) && /[a-z]/.test(token)) score += 2;
+        if (/[-_.]/.test(token)) score += 2;
+        if (/^[A-Za-z][A-Za-z0-9._-]{4,20}$/.test(token)) score += 1;
+        if (/kube|pod|sched|daemon|queue|webhook|controller|linux|spark|etcd|apiserver|grpc|http/i.test(token)) {
+          score += 3;
+        }
+        if (score > bestScore) {
+          best = token;
+          bestScore = score;
+        }
+      }
+      return normalize(best);
+    }
+
+    const cleaned = text
+      .replace(/[()（）[\]【】]/g, " ")
+      .replace(/^(排查|分析|根据|关于|修复|优化|实现|支持|检查|查看|处理|定位|解决|总结|评审|代码审查)\s*/i, "");
+    const segments = cleaned
+      .split(/[，,。.!?？:：/|]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const cnStop = new Set(["问题", "根因", "分析", "排查", "咨询", "理解", "评审", "会话", "目标", "代码"]);
+    for (const seg of segments) {
+      const candidate = seg
+        .replace(/^(排查|分析|根据|关于|修复|优化|实现|支持|检查|查看|处理|定位|解决|总结)\s*/i, "")
+        .replace(/(原理|机制|方案|方法|流程|问题|根因|时间|状态|实现|设计|优化|分析|排查|咨询|评审|理解)$/i, "")
+        .trim();
+      if (!candidate) continue;
+      if (cnStop.has(candidate)) continue;
+      if (/^[\u4e00-\u9fa5]{2,14}$/.test(candidate)) return candidate;
+    }
+    return "";
+  };
   const moduleName = (() => {
     const sourcePath = String(row.source_path ?? "").replace(/\\/g, "/");
     const parts = sourcePath.split("/").filter(Boolean);
     if (parts.length === 0) return "";
-    const filePart = parts[parts.length - 1] ?? "";
-    const name = normalize(filePart.replace(/\.(jsonl|json)$/i, ""));
-    if (name && !/^rollout-/i.test(name) && !/^session-/i.test(name) && !isNoise(name)) {
-      return name;
-    }
-    for (let i = parts.length - 2; i >= 0; i -= 1) {
-      const v = normalize(parts[i] ?? "");
-      if (!v || /^\d{4}$/.test(v) || /^\d{2}$/.test(v) || isNoise(v)) {
+    let best = "";
+    let bestScore = -1;
+    for (let i = parts.length - 1; i >= 0; i -= 1) {
+      const raw = normalize(parts[i] ?? "");
+      const v = normalize(raw.replace(/\.(jsonl|json|md|txt)$/i, ""));
+      if (!v || /^\d{4}$/.test(v) || /^\d{2}$/.test(v) || /^rollout-/i.test(v) || /^session-/i.test(v) || isNoise(v)) {
         continue;
       }
-      if (v.length >= 2) return v;
+      const lower = v.toLowerCase();
+      let score = 0;
+      if (/[-_]/.test(v)) score += 4;
+      if (/[a-z]/i.test(v) && /\d/.test(v)) score += 1;
+      if (/^[a-z][a-z0-9_-]{3,}$/i.test(v)) score += 2;
+      if (/kube|sched|daemon|server|controller|webhook|operator|gateway|proxy/i.test(v)) score += 2;
+      if (/\./.test(lower)) score -= 2;
+      if (score > bestScore) {
+        best = v;
+        bestScore = score;
+      }
     }
-    return "";
+    return best;
   })();
   const titleModule = extractModuleToken(titleNorm);
   const summaryModule = extractModuleToken(summaryNorm);
+  const titleEntity = extractEntityToken(titleNorm);
+  const summaryEntity = extractEntityToken(summaryNorm);
   const summaryKeyword = (() => {
     const m = summaryNorm.match(/(?:关键词|keywords)\s*[:：]\s*([^|\n]+)/i);
     if (!m?.[1]) return "";
@@ -257,20 +366,19 @@ function inferSessionPurposeAndTarget(row: SessionRow, settings: PurposeSettings
     return first ?? "";
   })();
 
-  const candidates: Array<{ value: string; kind: "module" | "keyword" | "fallback" }> = [
+  const candidates: Array<{ value: string; kind: "module" | "keyword" | "entity" }> = [
     { value: projectName, kind: "module" },
     { value: titleModule, kind: "module" },
     { value: summaryModule, kind: "module" },
     { value: moduleName, kind: "module" },
+    { value: titleEntity, kind: "entity" },
+    { value: summaryEntity, kind: "entity" },
     { value: summaryKeyword, kind: "keyword" },
-    { value: summaryNorm.split(/[。.!?]/)[0]?.trim() ?? "", kind: "fallback" },
-    { value: titleNorm.split(/[。.!?]/)[0]?.trim() ?? "", kind: "fallback" },
   ];
 
   const picked = candidates.find((item) => {
     const v = normalize(item.value);
     if (isNoise(v)) return false;
-    if (item.kind !== "module" && titleNorm && titleNorm.includes(v)) return false;
     return true;
   });
 
@@ -278,9 +386,6 @@ function inferSessionPurposeAndTarget(row: SessionRow, settings: PurposeSettings
   if (!session_target) session_target = projectName || titleModule || summaryModule || "会话目标";
   if (isNoise(session_target)) session_target = "会话目标";
 
-  if ((picked?.kind ?? "fallback") !== "module" && session_target.length > settings.shortTargetMaxLen) {
-    session_target = `${session_target.slice(0, settings.shortTargetMaxLen).trim()}…`;
-  }
   return { session_purpose, session_target };
 }
 
@@ -291,7 +396,8 @@ function withResumeHint(row: SessionRow, purposeSettings: PurposeSettings): Sess
   const inferred = inferSessionPurposeAndTarget(row, purposeSettings);
   const savedPurpose = typeof row.session_purpose === "string" ? row.session_purpose.trim() : "";
   const savedTarget = typeof row.session_target === "string" ? row.session_target.trim() : "";
-  const displayTitle = sanitizeDisplayTitle(String(row.title ?? ""), savedTarget || inferred.session_target);
+  const effectiveTarget = !savedTarget || savedTarget === "会话目标" ? inferred.session_target : savedTarget;
+  const displayTitle = sanitizeDisplayTitle(String(row.title ?? ""), effectiveTarget);
   return {
     ...row,
     title: displayTitle,
@@ -299,7 +405,7 @@ function withResumeHint(row: SessionRow, purposeSettings: PurposeSettings): Sess
     resume_command: hint.command,
     resume_label: hint.label,
     session_purpose: savedPurpose || inferred.session_purpose,
-    session_target: savedTarget || inferred.session_target,
+    session_target: effectiveTarget,
   };
 }
 
@@ -313,6 +419,62 @@ app.post("/api/sync", async () => {
 app.post("/api/reindex", async () => {
   const result = startSyncTask("reindex");
   return { ok: true, started: result.started, state: result.state };
+});
+
+app.post("/api/reindex/session", async (request, reply) => {
+  const body = (request.body ?? {}) as { sessionId?: string };
+  const sessionId = String(body.sessionId ?? "").trim();
+  if (!sessionId) {
+    reply.code(400);
+    return { ok: false, error: "sessionId is required" };
+  }
+  const taskState = getSyncTaskState();
+  if (taskState.running) {
+    reply.code(409);
+    return { ok: false, error: "sync task running, try later" };
+  }
+
+  const row = db
+    .prepare("SELECT id, tool, source_path FROM sessions WHERE id = ?")
+    .get(sessionId) as { id: string; tool: string; source_path: string } | undefined;
+  if (!row) {
+    reply.code(404);
+    return { ok: false, error: "session not found" };
+  }
+  if (!row.source_path) {
+    reply.code(400);
+    return { ok: false, error: "source_path missing for this session" };
+  }
+
+  db.prepare("DELETE FROM ingest_state WHERE source_path = ?").run(row.source_path);
+  const onlyPaths = new Set([row.source_path]);
+  const stats =
+    row.tool === "codex"
+      ? syncCodexSessions(undefined, { onlyPaths })
+      : row.tool === "claude"
+        ? syncClaudeSessions(undefined, { onlyPaths })
+        : row.tool === "copilot"
+          ? syncCopilotSessions(undefined, { onlyPaths })
+          : row.tool === "gemini"
+            ? syncGeminiSessions(undefined, { onlyPaths })
+            : null;
+  if (!stats) {
+    reply.code(400);
+    return { ok: false, error: `unsupported tool: ${row.tool}` };
+  }
+  const latest = db
+    .prepare("SELECT id, tool, source_path, title, summary, project FROM sessions WHERE source_path = ? LIMIT 1")
+    .get(row.source_path) as SessionRow | undefined;
+  if (latest) {
+    const inferred = inferSessionPurposeAndTarget(latest, getPurposeSettings());
+    db.prepare("UPDATE sessions SET session_purpose = ?, session_target = ?, updated_at = ? WHERE id = ?").run(
+      inferred.session_purpose,
+      inferred.session_target,
+      new Date().toISOString(),
+      latest.id
+    );
+  }
+  return { ok: true, stats, sessionId: row.id };
 });
 
 app.get("/api/sync/status", async () => {
