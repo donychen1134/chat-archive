@@ -237,6 +237,20 @@ function dedupeAdjacent(messages: Message[]): ViewMessage[] {
 
 function MessageView({ message, query }: { message: ViewMessage; query: string }) {
   const segments = useMemo(() => parseCodeBlocks(message.content), [message.content]);
+  const [copiedCodeIndex, setCopiedCodeIndex] = useState<number | null>(null);
+
+  async function copyCodeSegment(code: string, index: number) {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopiedCodeIndex(index);
+      window.setTimeout(() => {
+        setCopiedCodeIndex((current) => (current === index ? null : current));
+      }, 1500);
+    } catch {
+      // Keep failure silent here; message-level copy is a convenience action.
+    }
+  }
+
   return (
     <div className={`message message-${message.role}`} id={`msg-${message.id}`}>
       <div className="message-head">
@@ -247,9 +261,25 @@ function MessageView({ message, query }: { message: ViewMessage; query: string }
         {segments.map((segment, idx) => {
           if (segment.kind === "code") {
             return (
-              <SyntaxHighlighter key={idx} language={segment.lang} style={oneLight} customStyle={{ margin: "8px 0" }}>
-                {segment.value}
-              </SyntaxHighlighter>
+              <div key={idx} className="code-block-wrap">
+                <div className="code-block-toolbar">
+                  <span className="code-block-lang">{segment.lang || "text"}</span>
+                  <button
+                    className="code-copy-btn"
+                    type="button"
+                    onClick={() => void copyCodeSegment(segment.value, idx)}
+                  >
+                    {copiedCodeIndex === idx ? "已复制" : "复制代码"}
+                  </button>
+                </div>
+                <SyntaxHighlighter
+                  language={segment.lang}
+                  style={oneLight}
+                  customStyle={{ margin: 0, borderRadius: "0 0 10px 10px" }}
+                >
+                  {segment.value}
+                </SyntaxHighlighter>
+              </div>
             );
           }
           return (

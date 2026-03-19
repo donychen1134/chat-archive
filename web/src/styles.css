@@ -640,6 +640,46 @@ button:disabled {
   padding: 8px 10px;
 }
 
+.code-block-wrap {
+  margin: 8px 0;
+  border: 1px solid #dde7e3;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #f8fbfa;
+}
+
+.code-block-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  border-bottom: 1px solid #e3ece8;
+  background: linear-gradient(90deg, #f4fbfa 0%, #fbfaf5 100%);
+}
+
+.code-block-lang {
+  font-size: 11px;
+  font-weight: 700;
+  color: #60726c;
+  text-transform: lowercase;
+}
+
+.code-copy-btn {
+  border: 1px solid #b7c9c1;
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: #ffffff;
+  color: #2a4441;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.code-block-wrap pre {
+  margin: 0 !important;
+}
+
 .plain-text {
   margin: 0;
   white-space: pre-wrap;
