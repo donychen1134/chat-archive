@@ -5,6 +5,7 @@ import { syncClaudeSessions } from "./claude-ingest.js";
 import { syncCodexSessions } from "./codex-ingest.js";
 import { syncCopilotSessions } from "./copilot-ingest.js";
 import { syncGeminiSessions } from "./gemini-ingest.js";
+import { syncOpencodeSessions } from "./opencode-ingest.js";
 import {
   getPurposeSettings,
   getSummarySettings,
@@ -26,7 +27,7 @@ await app.register(cors, { origin: true });
 
 type SessionRow = {
   id: string;
-  tool: "codex" | "claude" | "copilot" | "gemini" | string;
+  tool: "codex" | "claude" | "copilot" | "gemini" | "opencode" | string;
   source_path: string;
   [key: string]: unknown;
 };
@@ -52,6 +53,7 @@ function extractNativeSessionId(tool: string, id: string, sourcePath: string): s
     const parts = tail.split(":");
     return parts[parts.length - 1] ?? null;
   }
+  if (tool === "opencode") return tail;
   return null;
 }
 
@@ -137,6 +139,9 @@ function buildResumeHint(
       return { command: `${projectPrefix}gemini -r ${nativeSessionId}`, label: "Resume" };
     }
     return { command: "gemini --list-sessions", label: "List sessions" };
+  }
+  if (tool === "opencode" && nativeSessionId) {
+    return { command: `${projectPrefix}opencode --session ${nativeSessionId}`, label: "Resume" };
   }
   return { command: "", label: "" };
 }
@@ -230,6 +235,11 @@ function inferSessionPurposeAndTarget(row: SessionRow, settings: PurposeSettings
     "repos",
     "repo",
     "chat-archive",
+    "share",
+    "local",
+    "state",
+    "opencode",
+    "opencode.db",
   ]);
   const normalize = (value: string): string => value.replace(/\s+/g, " ").trim();
   const looksLikeUuid = (value: string): boolean =>
@@ -247,6 +257,9 @@ function inferSessionPurposeAndTarget(row: SessionRow, settings: PurposeSettings
     if (looksLikeId(v)) return true;
     if (/^[a-z]{1,3}$/i.test(v)) return true;
     if (/^\d+$/.test(v)) return true;
+    if (v.includes("#session:")) return true;
+    if (v.endsWith(".db")) return true;
+    if (v.includes(".db#")) return true;
     if (v.startsWith(".") && !v.includes("-") && !v.includes("_")) return true;
     return false;
   };
@@ -263,6 +276,16 @@ function inferSessionPurposeAndTarget(row: SessionRow, settings: PurposeSettings
       "session",
       "summary",
       "target",
+      "task",
+      "check",
+      "trace",
+      "inspect",
+      "investigate",
+      "install",
+      "configure",
+      "external",
+      "behavior",
+      "subagent",
       "review",
       "analysis",
       "problem",
@@ -344,6 +367,7 @@ function inferSessionPurposeAndTarget(row: SessionRow, settings: PurposeSettings
       if (/^[a-z][a-z0-9_-]{3,}$/i.test(v)) score += 2;
       if (/kube|sched|daemon|server|controller|webhook|operator|gateway|proxy/i.test(v)) score += 2;
       if (/\./.test(lower)) score -= 2;
+      if (/#|:/.test(v)) score -= 6;
       if (score > bestScore) {
         best = v;
         bestScore = score;
@@ -457,6 +481,8 @@ app.post("/api/reindex/session", async (request, reply) => {
           ? syncCopilotSessions(undefined, { onlyPaths })
           : row.tool === "gemini"
             ? syncGeminiSessions(undefined, { onlyPaths })
+            : row.tool === "opencode"
+              ? syncOpencodeSessions(undefined, { onlyPaths })
             : null;
   if (!stats) {
     reply.code(400);
@@ -555,13 +581,18 @@ app.get("/api/sessions", async (request, reply) => {
     | "codex"
     | "claude"
     | "copilot"
-    | "gemini";
+    | "gemini"
+    | "opencode";
   const toolsRaw = (request.query as Record<string, string | undefined>).tools?.trim() ?? "";
   const fromTools = toolsRaw
     .split(",")
     .map((v) => v.trim())
-    .filter((v): v is "codex" | "claude" | "copilot" | "gemini" => v === "codex" || v === "claude" || v === "copilot" || v === "gemini");
-  const legacyTool = tool === "codex" || tool === "claude" || tool === "copilot" || tool === "gemini" ? [tool] : [];
+    .filter(
+      (v): v is "codex" | "claude" | "copilot" | "gemini" | "opencode" =>
+        v === "codex" || v === "claude" || v === "copilot" || v === "gemini" || v === "opencode"
+    );
+  const legacyTool =
+    tool === "codex" || tool === "claude" || tool === "copilot" || tool === "gemini" || tool === "opencode" ? [tool] : [];
   const toolFilters = Array.from(new Set([...(fromTools.length > 0 ? fromTools : legacyTool)]));
   const page = Math.max(1, Number((request.query as Record<string, string | undefined>).page ?? "1"));
   const pageSize = Math.min(100, Math.max(1, Number((request.query as Record<string, string | undefined>).pageSize ?? "20")));

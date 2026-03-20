@@ -420,6 +420,12 @@ button:disabled {
   border-color: #afebe4;
 }
 
+.tool-opencode {
+  color: #8f1238;
+  background: #ffe7ef;
+  border-color: #f4b7ca;
+}
+
 .summary-headline {
   margin-top: 8px;
   font-size: 12px;

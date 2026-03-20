@@ -5,8 +5,8 @@ import { oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 
 type Scope = "all" | "question" | "answer";
 type Role = "user" | "assistant" | "tool" | "system";
-type ToolFilter = "codex" | "claude" | "copilot" | "gemini";
-const ALL_TOOLS: ToolFilter[] = ["codex", "claude", "copilot", "gemini"];
+type ToolFilter = "codex" | "claude" | "copilot" | "gemini" | "opencode";
+const ALL_TOOLS: ToolFilter[] = ["codex", "claude", "copilot", "gemini", "opencode"];
 
 interface Session {
   id: string;
@@ -978,6 +978,12 @@ export function App() {
             >
               Gemini
             </button>
+            <button
+              className={`tool-chip ${selectedTools.includes("opencode") ? "active" : ""}`}
+              onClick={(e) => toggleTool("opencode", e.metaKey || e.ctrlKey || e.shiftKey)}
+            >
+              OpenCode
+            </button>
           </div>
           <div className="tool-filter-tip">单击单选，按 Cmd/Ctrl/Shift 可多选</div>
         </div>
@@ -1032,6 +1038,8 @@ export function App() {
                           ? "Copilot"
                           : session.tool === "gemini"
                             ? "Gemini"
+                            : session.tool === "opencode"
+                              ? "OpenCode"
                             : session.tool}
                   </span>
                   <span>{formatTime(session.start_time)}</span>
@@ -1065,6 +1073,8 @@ export function App() {
                             ? "Copilot"
                             : selectedSession.tool === "gemini"
                               ? "Gemini"
+                              : selectedSession.tool === "opencode"
+                                ? "OpenCode"
                               : selectedSession.tool}
                     </span>
                     <span className="meta-time">开始时间：{formatTime(selectedSession.start_time)}</span>
