@@ -21,6 +21,7 @@ interface Session {
   summary_provider?: string;
   summary_status?: string;
   message_count: number;
+  question_count?: number;
   native_session_id?: string | null;
   resume_command?: string;
   resume_label?: string;
@@ -1042,7 +1043,10 @@ export function App() {
                               ? "OpenCode"
                             : session.tool}
                   </span>
-                  <span>{formatTime(session.start_time)}</span>
+                  <span className="meta-side">
+                    <span className="meta-questions">提问 {session.question_count ?? 0}</span>
+                    <span>{formatTime(session.start_time)}</span>
+                  </span>
                 </div>
                 <div className="session-tags">
                   <span className="tag-purpose">{session.session_purpose ?? "问题咨询"}</span>

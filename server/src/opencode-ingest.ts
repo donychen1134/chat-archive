@@ -88,6 +88,10 @@ function sessionSourcePath(dbPath: string, sessionId: string): string {
   return `${dbPath}#session:${sessionId}`;
 }
 
+function isSubagentTitle(title: string): boolean {
+  return /\(@[^)]+ subagent\)/i.test(title);
+}
+
 function normalizeOpencodeTitle(rawTitle: string, messages: MessageRecord[]): string {
   const title = rawTitle.trim();
   const firstUser = messages.find((msg) => msg.role === "user")?.content.trim() ?? "";
@@ -130,8 +134,10 @@ export function countOpencodeSessionFiles(): number {
   if (!fs.existsSync(file)) return 0;
   const source = new Database(file, { readonly: true, fileMustExist: true });
   try {
-    const row = source.prepare("SELECT COUNT(*) AS c FROM session WHERE time_archived IS NULL").get() as { c: number };
-    return row.c;
+    const rows = source
+      .prepare("SELECT title FROM session WHERE time_archived IS NULL")
+      .all() as Array<{ title: string }>;
+    return rows.filter((row) => !isSubagentTitle(String(row.title ?? ""))).length;
   } finally {
     source.close();
   }
@@ -257,9 +263,30 @@ export function syncOpencodeSessions(
         "SELECT id, directory, title, time_created, time_updated FROM session WHERE time_archived IS NULL ORDER BY time_updated DESC"
       )
       .all() as OpencodeSessionRow[];
-    const filteredSessions = sessions.filter((session) => !onlyPaths || onlyPaths.has(sessionSourcePath(file, session.id)));
+    const filteredSessions = sessions.filter(
+      (session) => !isSubagentTitle(session.title) && (!onlyPaths || onlyPaths.has(sessionSourcePath(file, session.id)))
+    );
     stats.scannedFiles = filteredSessions.length;
     emitProgress();
+
+    const archivedSubagentIds = sessions
+      .filter((session) => isSubagentTitle(session.title))
+      .map((session) => `opencode:${session.id}`);
+    if (archivedSubagentIds.length > 0) {
+      const deleteSession = db.prepare("DELETE FROM sessions WHERE id = ?");
+      const deleteMessages = db.prepare("DELETE FROM messages WHERE session_id = ?");
+      const deleteFts = db.prepare("DELETE FROM message_fts WHERE session_id = ?");
+      const deleteIngestState = db.prepare("DELETE FROM ingest_state WHERE source_path = ?");
+      const cleanup = db.transaction((ids: string[]) => {
+        for (const id of ids) {
+          deleteFts.run(id);
+          deleteMessages.run(id);
+          deleteSession.run(id);
+          deleteIngestState.run(sessionSourcePath(file, id.replace(/^opencode:/, "")));
+        }
+      });
+      cleanup(archivedSubagentIds);
+    }
 
     const getState = db.prepare("SELECT last_mtime_ms, last_size FROM ingest_state WHERE source_path = ?");
     const upsertState = db.prepare(`

@@ -40,6 +40,15 @@ type SessionEnriched = SessionRow & {
   session_target: string;
 };
 
+const SESSION_SELECT_COLUMNS = `
+  s.*,
+  (
+    SELECT COUNT(*)
+    FROM messages m
+    WHERE m.session_id = s.id AND m.role = 'user'
+  ) AS question_count
+`;
+
 function extractNativeSessionId(tool: string, id: string, sourcePath: string): string | null {
   if (tool === "codex") {
     const m = sourcePath.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
@@ -605,7 +614,7 @@ app.get("/api/sessions", async (request, reply) => {
     const rows = (await withDbRetry(() =>
       db
         .prepare(
-          `SELECT * FROM sessions s WHERE 1=1 ${toolClause} ORDER BY datetime(start_time) DESC LIMIT ? OFFSET ?`
+          `SELECT ${SESSION_SELECT_COLUMNS} FROM sessions s WHERE 1=1 ${toolClause} ORDER BY datetime(start_time) DESC LIMIT ? OFFSET ?`
         )
         .all(...toolFilters, pageSize, offset)
     )) as SessionRow[];
@@ -647,6 +656,11 @@ app.get("/api/sessions", async (request, reply) => {
           s.session_purpose,
           s.session_target,
           s.message_count,
+          (
+            SELECT COUNT(*)
+            FROM messages m
+            WHERE m.session_id = s.id AND m.role = 'user'
+          ) AS question_count,
           s.created_at,
           s.updated_at,
           f.role AS hit_role,
@@ -670,6 +684,11 @@ app.get("/api/sessions", async (request, reply) => {
           s.session_purpose,
           s.session_target,
           s.message_count,
+          (
+            SELECT COUNT(*)
+            FROM messages m
+            WHERE m.session_id = s.id AND m.role = 'user'
+          ) AS question_count,
           s.created_at,
           s.updated_at,
           'meta' AS hit_role,
@@ -700,6 +719,7 @@ app.get("/api/sessions", async (request, reply) => {
         session_purpose,
         session_target,
         message_count,
+        question_count,
         created_at,
         updated_at,
         0.0 AS hit_score,
@@ -724,6 +744,7 @@ app.get("/api/sessions", async (request, reply) => {
         session_purpose,
         session_target,
         message_count,
+        question_count,
         created_at,
         updated_at
       ORDER BY datetime(start_time) DESC
@@ -780,6 +801,11 @@ app.get("/api/sessions", async (request, reply) => {
           s.session_purpose,
           s.session_target,
           s.message_count,
+          (
+            SELECT COUNT(*)
+            FROM messages m
+            WHERE m.session_id = s.id AND m.role = 'user'
+          ) AS question_count,
           s.created_at,
           s.updated_at,
           f.role AS hit_role,
@@ -803,6 +829,7 @@ app.get("/api/sessions", async (request, reply) => {
         session_purpose,
         session_target,
         message_count,
+        question_count,
         created_at,
         updated_at,
         0.0 AS hit_score,
@@ -827,6 +854,7 @@ app.get("/api/sessions", async (request, reply) => {
         session_purpose,
         session_target,
         message_count,
+        question_count,
         created_at,
         updated_at
       ORDER BY datetime(start_time) DESC
@@ -868,7 +896,7 @@ app.get("/api/session", async (request, reply) => {
   }
 
   const rawSession = (await withDbRetry(() =>
-    db.prepare("SELECT * FROM sessions WHERE id = ?").get(id)
+    db.prepare(`SELECT ${SESSION_SELECT_COLUMNS} FROM sessions s WHERE s.id = ?`).get(id)
   )) as SessionRow | undefined;
   const session = rawSession ? withResumeHint(rawSession, getPurposeSettings()) : null;
   if (!session) {

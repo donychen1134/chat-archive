@@ -386,6 +386,19 @@ button:disabled {
   flex-wrap: wrap;
 }
 
+.meta-side {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.meta-questions {
+  font-weight: 700;
+  color: #556761;
+}
+
 .tool-badge {
   display: inline-flex;
   align-items: center;
