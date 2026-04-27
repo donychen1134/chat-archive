@@ -6,6 +6,7 @@ import { oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 type Scope = "all" | "question" | "answer";
 type Role = "user" | "assistant" | "tool" | "system";
 type ToolFilter = "codex" | "claude" | "copilot" | "gemini" | "opencode";
+type ViewMode = "archive" | "usage";
 const ALL_TOOLS: ToolFilter[] = ["codex", "claude", "copilot", "gemini", "opencode"];
 
 interface Session {
@@ -30,6 +31,19 @@ interface Session {
   hit_score?: number;
   hit_roles?: string;
   hit_excerpt?: string;
+  usage_status?: string | null;
+  usage_provider?: string | null;
+  usage_model?: string | null;
+  usage_input_tokens?: number | null;
+  usage_output_tokens?: number | null;
+  usage_reasoning_tokens?: number | null;
+  usage_cache_read_tokens?: number | null;
+  usage_cache_write_tokens?: number | null;
+  usage_tool_tokens?: number | null;
+  usage_total_tokens?: number | null;
+  usage_cost?: number | null;
+  usage_record_count?: number | null;
+  last_usage_time?: string | null;
 }
 
 interface SyncState {
@@ -77,6 +91,46 @@ interface SessionDetailResponse {
   messages: Message[];
 }
 
+interface UsageOverview {
+  sessions?: number | null;
+  total_tokens?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  cache_read_tokens?: number | null;
+  cache_write_tokens?: number | null;
+  tool_tokens?: number | null;
+  cost?: number | null;
+}
+
+interface UsageOverviewResponse {
+  ok: boolean;
+  totals: UsageOverview;
+  recent: { total_tokens?: number | null; cost?: number | null };
+  byTool: Array<{ tool: string; sessions: number; total_tokens: number; cost: number | null }>;
+  coverage: { totalSessions: number; coveredSessions: number };
+}
+
+interface UsageTimeseriesItem {
+  day: string;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  tool_tokens: number;
+  total_tokens: number;
+  cost: number | null;
+}
+
+interface SessionUsageResponse {
+  ok: boolean;
+  summary: Record<string, unknown> | null;
+  records: Array<Record<string, unknown>>;
+  contributions?: Array<Record<string, unknown>>;
+  timeline?: Array<{ day: string; total_tokens: number }>;
+}
+
 interface ViewMessage extends Message {
   duplicateCount: number;
 }
@@ -108,6 +162,21 @@ function parseSummary(summary: string): { headline: string; keywords: string } {
 function formatTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+}
+
+function formatNumber(value: number | null | undefined): string {
+  return new Intl.NumberFormat("zh-CN").format(Number(value ?? 0));
+}
+
+function formatCost(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "--";
+  return Number(value).toLocaleString("zh-CN", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+}
+
+function usageStatusLabel(value: string | null | undefined): string {
+  if (value === "exact") return "精确";
+  if (value === "partial") return "部分";
+  return "缺失";
 }
 
 function parseCodeBlocks(content: string): Array<{ kind: "text" | "code"; value: string; lang?: string }> {
@@ -306,6 +375,7 @@ function groupTurns(messages: ViewMessage[]): Map<number, ViewMessage[]> {
 }
 
 export function App() {
+  const [viewMode, setViewMode] = useState<ViewMode>("archive");
   const [searchScope, setSearchScope] = useState<Scope>("all");
   const [selectedTools, setSelectedTools] = useState<ToolFilter[]>(ALL_TOOLS);
   const [searchInput, setSearchInput] = useState("");
@@ -349,6 +419,12 @@ export function App() {
   const [syncDetailOpen, setSyncDetailOpen] = useState(false);
   const [copiedSessionId, setCopiedSessionId] = useState<string | null>(null);
   const [copiedWorkdir, setCopiedWorkdir] = useState(false);
+  const [usageOverview, setUsageOverview] = useState<UsageOverviewResponse | null>(null);
+  const [usageTimeseries, setUsageTimeseries] = useState<UsageTimeseriesItem[]>([]);
+  const [usageSessions, setUsageSessions] = useState<Session[]>([]);
+  const [usageTotalSessions, setUsageTotalSessions] = useState(0);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [sessionUsage, setSessionUsage] = useState<SessionUsageResponse | null>(null);
   const sessionsRequestRef = useRef<AbortController | null>(null);
   const syncRunning = Boolean(syncState?.running);
 
@@ -573,6 +649,51 @@ export function App() {
     }
   }
 
+  async function fetchSessionUsage(sessionId: string) {
+    try {
+      const response = await fetch(`/api/session/usage?id=${encodeURIComponent(sessionId)}`);
+      if (!response.ok) return;
+      const data = (await response.json()) as SessionUsageResponse;
+      setSessionUsage(data);
+    } catch {
+      setSessionUsage(null);
+    }
+  }
+
+  async function fetchUsageDashboard() {
+    try {
+      setUsageLoading(true);
+      const params = new URLSearchParams();
+      if (selectedTools.length > 0 && selectedTools.length < ALL_TOOLS.length) {
+        params.set("tools", selectedTools.join(","));
+      }
+      const [overviewResp, timeseriesResp, sessionsResp] = await Promise.all([
+        fetch(`/api/usage/overview?${params.toString()}`),
+        fetch(`/api/usage/timeseries?${params.toString()}`),
+        fetch(`/api/usage/sessions?${new URLSearchParams({ ...Object.fromEntries(params.entries()), page: String(page), pageSize: String(pageSize) }).toString()}`),
+      ]);
+      if (overviewResp.ok) {
+        const overview = (await overviewResp.json()) as UsageOverviewResponse;
+        setUsageOverview(overview);
+      }
+      if (timeseriesResp.ok) {
+        const data = (await timeseriesResp.json()) as { ok: boolean; items: UsageTimeseriesItem[] };
+        setUsageTimeseries(data.items ?? []);
+      }
+      if (sessionsResp.ok) {
+        const data = (await sessionsResp.json()) as { ok: boolean; items: Session[]; total: number };
+        setUsageSessions(data.items ?? []);
+        setUsageTotalSessions(data.total ?? 0);
+      }
+      setServerOk(true);
+    } catch {
+      setServerOk(false);
+      setError("读取 usage 统计失败，请检查后端服务状态。");
+    } finally {
+      setUsageLoading(false);
+    }
+  }
+
   async function syncNow() {
     try {
       setSyncing(true);
@@ -697,8 +818,12 @@ export function App() {
   }
 
   useEffect(() => {
-    void fetchSessions();
-  }, [appliedScope, appliedQuery, selectedTools, page, pageSize]);
+    if (viewMode === "archive") {
+      void fetchSessions();
+      return;
+    }
+    void fetchUsageDashboard();
+  }, [viewMode, appliedScope, appliedQuery, selectedTools, page, pageSize]);
 
   useEffect(() => {
     if (!loading) setSearching(false);
@@ -746,8 +871,10 @@ export function App() {
     if (!selected) return;
     setCopiedWorkdir(false);
     setSessionDetail(null);
+    setSessionUsage(null);
     setMessages([]);
     void fetchSessionDetail(selected);
+    void fetchSessionUsage(selected);
   }, [selected]);
 
   const allMessages = useMemo(() => dedupeAdjacent(messages), [messages]);
@@ -769,9 +896,11 @@ export function App() {
     }
   }, [systemToolMessageCount, showSystemAndTool]);
 
-  const totalPages = Math.max(1, Math.ceil(totalSessions / pageSize));
-  const currentStart = totalSessions === 0 ? 0 : (page - 1) * pageSize + 1;
-  const currentEnd = Math.min(totalSessions, page * pageSize);
+  const listTotal = viewMode === "usage" ? usageTotalSessions : totalSessions;
+  const listItems = viewMode === "usage" ? usageSessions : sessions;
+  const totalPages = Math.max(1, Math.ceil(listTotal / pageSize));
+  const currentStart = listTotal === 0 ? 0 : (page - 1) * pageSize + 1;
+  const currentEnd = Math.min(listTotal, page * pageSize);
 
   function runSearch() {
     if (loading) return;
@@ -845,6 +974,12 @@ export function App() {
     () => parseSummary(selectedSession?.summary ?? ""),
     [selectedSession?.summary]
   );
+  const sessionUsageTimeline = useMemo(() => {
+    return (sessionUsage?.timeline ?? []).map((item) => ({
+      day: item.day,
+      total: Number(item.total_tokens ?? 0),
+    }));
+  }, [sessionUsage]);
 
   return (
     <div className="app">
@@ -857,6 +992,14 @@ export function App() {
             <h1>Chat Archive</h1>
           </div>
           <div className="toolbar-actions">
+            <div className="view-toggle">
+              <button className={viewMode === "archive" ? "active" : ""} onClick={() => setViewMode("archive")}>
+                会话归档
+              </button>
+              <button className={viewMode === "usage" ? "active" : ""} onClick={() => setViewMode("usage")}>
+                Token Usage
+              </button>
+            </div>
             <button
               className={`summary-launch-btn ${settingsDrawer === "summary" ? "active" : ""}`}
               onClick={() => setSettingsDrawer((v) => (v === "summary" ? null : "summary"))}
@@ -913,29 +1056,31 @@ export function App() {
             )}
           </>
         )}
-        <div className="top-search">
-          <input
-            value={searchInput}
-            placeholder="Search"
-            onChange={(e) => setSearchInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                runSearch();
-              }
-            }}
-          />
-          <select value={searchScope} onChange={(e) => setSearchScope(e.target.value as Scope)}>
-            <option value="question">提问内容</option>
-            <option value="answer">回答内容</option>
-            <option value="all">全文</option>
-          </select>
-          <button onClick={runSearch} disabled={searching || loading}>
-            {searching || loading ? "搜索中..." : "Search"}
-          </button>
-          <button onClick={clearSearch} disabled={searching || loading || (!appliedQuery && !searchInput)}>
-            清空
-          </button>
-        </div>
+        {viewMode === "archive" && (
+          <div className="top-search">
+            <input
+              value={searchInput}
+              placeholder="Search"
+              onChange={(e) => setSearchInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  runSearch();
+                }
+              }}
+            />
+            <select value={searchScope} onChange={(e) => setSearchScope(e.target.value as Scope)}>
+              <option value="question">提问内容</option>
+              <option value="answer">回答内容</option>
+              <option value="all">全文</option>
+            </select>
+            <button onClick={runSearch} disabled={searching || loading}>
+              {searching || loading ? "搜索中..." : "Search"}
+            </button>
+            <button onClick={clearSearch} disabled={searching || loading || (!appliedQuery && !searchInput)}>
+              清空
+            </button>
+          </div>
+        )}
         {error && <div className="error">{error}</div>}
       </header>
 
@@ -1019,9 +1164,9 @@ export function App() {
           </div>
         </div>
         <div className="session-list">
-          {loading && <div className="hint">Loading...</div>}
-          {!loading && sessions.length === 0 && <div className="hint">No sessions</div>}
-          {sessions.map((session) => (
+          {(loading || usageLoading) && <div className="hint">Loading...</div>}
+          {!loading && !usageLoading && listItems.length === 0 && <div className="hint">No sessions</div>}
+          {listItems.map((session) => (
             <button
               key={session.id}
               className={`session-item ${selected === session.id ? "active" : ""}`}
@@ -1052,6 +1197,23 @@ export function App() {
                   <span className="tag-purpose">{session.session_purpose ?? "问题咨询"}</span>
                   <span className="tag-target" title={session.session_target}>{session.session_target ?? "会话主题"}</span>
                 </div>
+                {typeof session.usage_total_tokens === "number" && session.usage_total_tokens > 0 && (
+                  <div className="usage-mini">
+                    <span>{formatNumber(session.usage_total_tokens)} tokens</span>
+                    <span
+                      className={`usage-status usage-${session.usage_status ?? "unavailable"} subtle`}
+                      title={
+                        session.usage_status === "partial"
+                          ? "该 CLI 当前仅采集到部分本地 usage 记录，会话总量可能不是完整值。"
+                          : session.usage_status === "exact"
+                            ? "该 CLI 当前 usage 记录可按本地数据精确统计。"
+                            : "当前未采集到 usage 数据。"
+                      }
+                    >
+                      {usageStatusLabel(session.usage_status)}
+                    </span>
+                  </div>
+                )}
                 {appliedQuery.trim() && session.hit_excerpt && (
                   <div className="hit-excerpt">{highlightText(session.hit_excerpt, appliedQuery)}</div>
                 )}
@@ -1062,8 +1224,89 @@ export function App() {
         </aside>
 
         <main className="main">
-          {!selected && <div className="empty">请选择一个会话</div>}
-          {selected && (
+          {viewMode === "usage" ? (
+            <section className="usage-dashboard">
+              <div className="usage-hero">
+                <div className="usage-stat-card">
+                  <span className="usage-stat-label">总 Token</span>
+                  <strong>{formatNumber(usageOverview?.totals.total_tokens)}</strong>
+                </div>
+                <div className="usage-stat-card">
+                  <span className="usage-stat-label">近 30 天</span>
+                  <strong>{formatNumber(usageOverview?.recent.total_tokens)}</strong>
+                </div>
+                <div className="usage-stat-card">
+                  <span className="usage-stat-label">总输入</span>
+                  <strong>{formatNumber(usageOverview?.totals.input_tokens)}</strong>
+                </div>
+                <div className="usage-stat-card">
+                  <span className="usage-stat-label">总输出</span>
+                  <strong>{formatNumber(usageOverview?.totals.output_tokens)}</strong>
+                </div>
+              </div>
+
+              <div className="usage-panels">
+                <section className="usage-panel">
+                  <div className="usage-panel-head">
+                    <h3>按日趋势</h3>
+                    <span>最近 {usageTimeseries.length} 天</span>
+                  </div>
+                  <div className="usage-timeseries">
+                    {usageTimeseries.map((item) => {
+                      const maxTokens = Math.max(...usageTimeseries.map((row) => row.total_tokens), 1);
+                      const width = `${Math.max(6, (item.total_tokens / maxTokens) * 100)}%`;
+                      return (
+                        <div key={item.day} className="usage-bar-row">
+                          <span className="usage-bar-label">{item.day}</span>
+                          <div className="usage-bar-track">
+                            <div className="usage-bar-fill" style={{ width }} />
+                          </div>
+                          <span className="usage-bar-value">{formatNumber(item.total_tokens)}</span>
+                        </div>
+                      );
+                    })}
+                    {usageTimeseries.length === 0 && <div className="hint">暂无 usage 数据</div>}
+                  </div>
+                </section>
+
+                <section className="usage-panel usage-breakdown">
+                  <div className="usage-panel-head">
+                    <h3>CLI 分布</h3>
+                    <span>按总 token 排序</span>
+                  </div>
+                  <div className="usage-breakdown-list">
+                    {(usageOverview?.byTool ?? []).map((item) => (
+                      <div key={item.tool} className="usage-breakdown-row">
+                        <span className={`tool-badge tool-${item.tool}`}>{item.tool === "claude" ? "Claude Code" : item.tool === "opencode" ? "OpenCode" : item.tool}</span>
+                        <strong>{formatNumber(item.total_tokens)}</strong>
+                        <span>{item.sessions} 会话</span>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              </div>
+
+              <section className="usage-panel">
+                <div className="usage-panel-head">
+                  <h3>高用量会话</h3>
+                  <span>当前筛选下按 token 排序</span>
+                </div>
+                <div className="usage-session-table">
+                  {usageSessions.map((item) => (
+                    <button key={item.id} className="usage-session-row" onClick={() => { setViewMode("archive"); setSelected(item.id); }}>
+                      <span className="usage-session-title">{item.title}</span>
+                      <span className={`tool-badge tool-${item.tool}`}>{item.tool === "claude" ? "Claude Code" : item.tool === "opencode" ? "OpenCode" : item.tool}</span>
+                      <span>{formatNumber(item.usage_total_tokens)}</span>
+                      <span className={`usage-status usage-${item.usage_status ?? "unavailable"}`}>{item.usage_status ?? "unavailable"}</span>
+                    </button>
+                  ))}
+                  {usageSessions.length === 0 && <div className="hint">暂无 usage 会话</div>}
+                </div>
+              </section>
+            </section>
+          ) : !selected ? (
+            <div className="empty">请选择一个会话</div>
+          ) : (
             <>
               {selectedSession && (
                 <section className="session-meta-card">
@@ -1085,10 +1328,12 @@ export function App() {
                   </div>
                   <div className="session-meta-grid">
                     <div className="session-meta-item">
-                      <span className="meta-key">会话目的 / 对象</span>
-                      <code className="meta-value">
-                        {(selectedSession.session_purpose ?? "问题咨询") + " / " + (selectedSession.session_target ?? "会话主题")}
-                      </code>
+                      <span className="meta-key">会话目的</span>
+                      <code className="meta-value">{selectedSession.session_purpose ?? "问题咨询"}</code>
+                    </div>
+                    <div className="session-meta-item">
+                      <span className="meta-key">对象</span>
+                      <code className="meta-value">{selectedSession.session_target ?? "未识别"}</code>
                     </div>
                     <div className="session-meta-item">
                       <span className="meta-key">会话总结</span>
@@ -1123,6 +1368,14 @@ export function App() {
                         </code>
                       </div>
                     )}
+                    <div className="session-meta-item">
+                      <span className="meta-key">Token Usage</span>
+                      <code className="meta-value">
+                        {selectedSession.usage_total_tokens
+                          ? `${formatNumber(selectedSession.usage_total_tokens)} tokens / ${usageStatusLabel(selectedSession.usage_status)}`
+                          : "未采集"}
+                      </code>
+                    </div>
                   </div>
                   <div className="session-meta-actions">
                     {(selectedSession.project ?? "").trim().length > 0 && (
@@ -1142,6 +1395,56 @@ export function App() {
                       {reindexingSessionId === selectedSession.id ? "重建中..." : "重建当前会话"}
                     </button>
                   </div>
+                  {sessionUsage?.summary && (
+                    <section className="session-usage-card">
+                      <div className="session-usage-card-head">
+                        <strong>Token Usage</strong>
+                        <span
+                          className={`usage-status usage-${String(sessionUsage.summary.usage_status ?? "unavailable")} subtle`}
+                          title={
+                            String(sessionUsage.summary.usage_status ?? "") === "partial"
+                              ? "该 CLI 当前只在部分消息或事件中记录 usage，因此这里展示的是已采集部分，不保证覆盖整个会话。"
+                              : "该 CLI 当前可从本地会话记录中较完整地提取 usage。"
+                          }
+                        >
+                          {usageStatusLabel(String(sessionUsage.summary.usage_status ?? ""))}
+                        </span>
+                      </div>
+                      <div className="session-usage-inline">
+                        <div className="usage-inline-chip">总量 {formatNumber(Number(sessionUsage.summary.total_tokens ?? 0))}</div>
+                        <div className="usage-inline-chip">输入 {formatNumber(Number(sessionUsage.summary.input_tokens ?? 0))}</div>
+                        <div className="usage-inline-chip">输出 {formatNumber(Number(sessionUsage.summary.output_tokens ?? 0))}</div>
+                        <div className="usage-inline-chip">缓存读 {formatNumber(Number(sessionUsage.summary.cache_read_tokens ?? 0))}</div>
+                        <div className="usage-inline-chip">缓存写 {formatNumber(Number(sessionUsage.summary.cache_write_tokens ?? 0))}</div>
+                        <div className="usage-inline-chip">记录 {formatNumber(Number(sessionUsage.summary.record_count ?? 0))}</div>
+                      </div>
+                      {sessionUsageTimeline.length > 0 && (
+                        <div className="session-usage-timeline">
+                          <div className="session-usage-timeline-head">按天变化</div>
+                          <div className="session-usage-timeline-list">
+                            {sessionUsageTimeline.map((item) => {
+                              const maxValue = Math.max(...sessionUsageTimeline.map((row) => row.total), 1);
+                              const width = `${Math.max(8, (item.total / maxValue) * 100)}%`;
+                              return (
+                                <div key={item.day} className="session-usage-timeline-row">
+                                  <span className="timeline-day">{item.day}</span>
+                                  <div className="timeline-track">
+                                    <div className="timeline-fill" style={{ width }} />
+                                  </div>
+                                  <span className="timeline-value">{formatNumber(item.total)}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                      <div className="session-usage-note">
+                        {String(sessionUsage.summary.usage_status ?? "") === "partial"
+                          ? "说明：该会话仅抓到部分本地 usage 记录。比如 Claude Code / Copilot 可能只在部分消息或会话结束时写 usage，所以这里更适合看趋势，不适合当作绝对精确总量。"
+                          : "说明：该会话 usage 来自本地会话记录，可用于会话级和按天统计。"}
+                      </div>
+                    </section>
+                  )}
                 </section>
               )}
               <div className="turn-toolbar">

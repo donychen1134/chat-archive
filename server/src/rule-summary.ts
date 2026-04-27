@@ -95,6 +95,50 @@ function effectiveMessages(messages: MessageRecord[]): MessageRecord[] {
   });
 }
 
+function normalizedLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function isWeakTitleLine(value: string): boolean {
+  const line = normalizedLine(value);
+  if (!line) return true;
+  const lower = line.toLowerCase();
+  if (
+    lower.startsWith("# ") ||
+    lower.startsWith("## ") ||
+    lower.startsWith("<command-message") ||
+    lower.startsWith("</command-message>") ||
+    lower.includes("instructions") ||
+    lower.includes("agent instructions") ||
+    lower.includes("skills:") ||
+    lower === "hello" ||
+    lower === "say hello" ||
+    lower === "你好" ||
+    lower === "你好，你是什么模型" ||
+    lower === "/status" ||
+    lower === "/status " ||
+    /^<[^>]+>$/.test(lower)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function pickBestTitle(messages: MessageRecord[]): string {
+  const userMessages = messages.filter((msg) => msg.role === "user");
+  for (const msg of userMessages) {
+    const lines = msg.content
+      .split("\n")
+      .map((line) => normalizedLine(line))
+      .filter(Boolean);
+    for (const line of lines) {
+      if (!isWeakTitleLine(line)) return line;
+    }
+  }
+  const fallback = normalizedLine(userMessages[0]?.content.split("\n").find((line) => line.trim().length > 0) ?? "");
+  return fallback || "未命名会话";
+}
+
 function topKeywords(text: string, max = 4): string[] {
   const enWords = text
     .toLowerCase()
@@ -116,11 +160,8 @@ function topKeywords(text: string, max = 4): string[] {
 
 export function buildTitleAndSummary(messages: MessageRecord[]): { title: string; summary: string } {
   const effective = effectiveMessages(messages);
-  const userFirst =
-    effective.find((msg) => msg.role === "user")?.content.trim() ??
-    messages.find((msg) => msg.role === "user")?.content.trim() ??
-    "未命名会话";
-  const firstLine = userFirst.split("\n").find((line) => line.trim().length > 0) ?? "未命名会话";
+  const titleSource = effective.length > 0 ? effective : messages.filter((m) => m.role === "user" || m.role === "assistant");
+  const firstLine = pickBestTitle(titleSource);
   const title = firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine;
 
   const joined = (effective.length > 0 ? effective : messages.filter((m) => m.role === "user" || m.role === "assistant"))

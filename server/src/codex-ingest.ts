@@ -5,7 +5,8 @@ import crypto from "node:crypto";
 import { db, nowIso } from "./db.js";
 import { buildSessionMetadataWithOptions } from "./summary-provider.js";
 import { getSummarySettings } from "./settings.js";
-import type { ChatRole, MessageRecord, SyncProgress, SyncStats } from "./types.js";
+import type { ChatRole, MessageRecord, SyncProgress, SyncStats, UsageInput } from "./types.js";
+import { replaceSessionUsage } from "./usage.js";
 
 function codexSessionsDir(): string {
   return process.env.CODEX_SESSIONS_DIR ?? path.join(os.homedir(), ".codex", "sessions");
@@ -165,11 +166,61 @@ function projectFromRecord(record: Record<string, unknown>): string | null {
   return null;
 }
 
-function parseFile(filePath: string, stat: fs.Stats): { project: string | null; messages: MessageRecord[] } {
+function asUsageNumber(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
+function extractUsageRecords(
+  record: Record<string, unknown>,
+  fallback: Date,
+  project: string | null
+): UsageInput[] {
+  const lineType = String(record.type ?? "");
+  if (lineType !== "event_msg") return [];
+  const payload = (record.payload ?? null) as Record<string, unknown> | null;
+  if (!payload || String(payload.type ?? "") !== "token_count") return [];
+  const info = (payload.info ?? null) as Record<string, unknown> | null;
+  if (!info) return [];
+  const total = ((info.last_token_usage ?? info.total_token_usage) ?? null) as Record<string, unknown> | null;
+  if (!total) return [];
+  const ts = parseTimestamp(record.timestamp, fallback);
+  const totalTokens = asUsageNumber(total.total_tokens);
+  if (totalTokens <= 0) return [];
+  return [
+    {
+      session_id: "",
+      tool: "codex",
+      project,
+      provider: null,
+      model: null,
+      record_type: "turn",
+      source_type: "native_exact",
+      usage_semantics: "delta",
+      usage_time: ts,
+      input_tokens: asUsageNumber(total.input_tokens),
+      output_tokens: asUsageNumber(total.output_tokens),
+      reasoning_tokens: asUsageNumber(total.reasoning_output_tokens),
+      cache_read_tokens: asUsageNumber(total.cached_input_tokens),
+      cache_write_tokens: 0,
+      tool_tokens: 0,
+      total_tokens: totalTokens,
+      cost: null,
+      raw_ref: `codex:token_count:${ts}`,
+    },
+  ];
+}
+
+function parseFile(filePath: string, stat: fs.Stats): { project: string | null; messages: MessageRecord[]; usage: UsageInput[] } {
   const raw = fs.readFileSync(filePath, "utf8");
   const lines = filePath.endsWith(".jsonl") ? raw.split(/\r?\n/).filter((l) => l.trim().length > 0) : [raw];
 
   const extracted: Array<{ role: ChatRole; ts: string; content: string }> = [];
+  const usage: UsageInput[] = [];
   let project: string | null = null;
   for (const line of lines) {
     try {
@@ -179,6 +230,9 @@ function parseFile(filePath: string, stat: fs.Stats): { project: string | null; 
           if (!project && item && typeof item === "object") {
             project = projectFromRecord(item as Record<string, unknown>) ?? project;
           }
+          if (item && typeof item === "object") {
+            usage.push(...extractUsageRecords(item as Record<string, unknown>, stat.mtime, project));
+          }
           const msg = extractMessage(item, stat.mtime);
           if (msg) extracted.push(msg);
         }
@@ -187,6 +241,7 @@ function parseFile(filePath: string, stat: fs.Stats): { project: string | null; 
         if (!project) {
           project = projectFromRecord(obj) ?? project;
         }
+        usage.push(...extractUsageRecords(obj, stat.mtime, project));
         const envelopeMessages = extractFromCodexEnvelope(obj, stat.mtime);
         if (envelopeMessages.length > 0) {
           extracted.push(...envelopeMessages);
@@ -247,7 +302,7 @@ function parseFile(filePath: string, stat: fs.Stats): { project: string | null; 
       seq_in_session: idx,
     };
   });
-  return { project, messages };
+  return { project, messages, usage: usage.map((item) => ({ ...item, project })) };
 }
 
 export function syncCodexSessions(
@@ -315,6 +370,7 @@ export function syncCodexSessions(
     const parsed = parseFile(filePath, stat);
     const project = parsed.project;
     const messages = parsed.messages;
+    const usage = parsed.usage;
 
     if (messages.length === 0) {
       stats.warnings += 1;
@@ -361,6 +417,15 @@ export function syncCodexSessions(
       insertMessage.run(msg.id, msg.session_id, msg.role, msg.ts, msg.content, msg.turn_index, msg.seq_in_session);
       insertFts.run(msg.id, msg.session_id, msg.role, msg.content);
     }
+
+    replaceSessionUsage(
+      sessionId,
+      usage.map((record) => ({
+        ...record,
+        session_id: sessionId,
+        project,
+      }))
+    );
 
     upsertState.run(filePath, Math.floor(stat.mtimeMs), stat.size, now);
     stats.updatedSessions += 1;

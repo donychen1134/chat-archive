@@ -5,13 +5,15 @@ import crypto from "node:crypto";
 import { db, nowIso } from "./db.js";
 import { buildSessionMetadataWithOptions } from "./summary-provider.js";
 import { getSummarySettings } from "./settings.js";
-import type { ChatRole, MessageRecord, SyncProgress, SyncStats } from "./types.js";
+import type { ChatRole, MessageRecord, SyncProgress, SyncStats, UsageInput } from "./types.js";
+import { replaceSessionUsage } from "./usage.js";
 
 type ParsedGeminiFile = {
   sessionIdHint: string | null;
   projectHash: string | null;
   project: string | null;
   messages: MessageRecord[];
+  usage: UsageInput[];
 };
 
 function geminiSessionsDir(): string {
@@ -69,6 +71,15 @@ function asText(input: unknown): string {
   return "";
 }
 
+function asUsageNumber(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
 function readProjectFromDotFile(filePath: string): string | null {
   const baseDir = path.dirname(path.dirname(filePath));
   const projectFile = path.join(baseDir, ".project_root");
@@ -87,6 +98,7 @@ function parseGeminiFile(filePath: string, stat: fs.Stats): ParsedGeminiFile {
   const list = Array.isArray(root.messages) ? (root.messages as Array<Record<string, unknown>>) : [];
 
   const extracted: Array<{ role: ChatRole; ts: string; content: string }> = [];
+  const usage: UsageInput[] = [];
   for (const item of list) {
     const rawType = String(item.type ?? "").toLowerCase();
     const role: ChatRole =
@@ -100,6 +112,37 @@ function parseGeminiFile(filePath: string, stat: fs.Stats): ParsedGeminiFile {
     if (!content) continue;
     const ts = parseTimestamp(item.timestamp, stat.mtime);
     extracted.push({ role, ts, content });
+    const tokens = (item.tokens ?? null) as Record<string, unknown> | null;
+    if (tokens && role === "assistant") {
+      const inputTokens = asUsageNumber(tokens.input);
+      const outputTokens = asUsageNumber(tokens.output);
+      const cacheTokens = asUsageNumber(tokens.cached);
+      const reasoningTokens = asUsageNumber(tokens.thoughts);
+      const toolTokens = asUsageNumber(tokens.tool);
+      const totalTokens = asUsageNumber(tokens.total) || inputTokens + outputTokens + cacheTokens + reasoningTokens + toolTokens;
+      if (totalTokens > 0) {
+        usage.push({
+          session_id: "",
+          tool: "gemini",
+          project: null,
+          provider: "google",
+          model: typeof item.model === "string" ? item.model : null,
+          record_type: "message",
+          source_type: "native_exact",
+          usage_semantics: "delta",
+          usage_time: ts,
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          reasoning_tokens: reasoningTokens,
+          cache_read_tokens: cacheTokens,
+          cache_write_tokens: 0,
+          tool_tokens: toolTokens,
+          total_tokens: totalTokens,
+          cost: null,
+          raw_ref: `gemini:tokens:${ts}:${usage.length}`,
+        });
+      }
+    }
   }
 
   const deduped: Array<{ role: ChatRole; ts: string; content: string }> = [];
@@ -140,7 +183,7 @@ function parseGeminiFile(filePath: string, stat: fs.Stats): ParsedGeminiFile {
   const projectHash =
     typeof root.projectHash === "string" && root.projectHash.trim().length > 0 ? root.projectHash.trim() : null;
   const project = readProjectFromDotFile(filePath);
-  return { sessionIdHint, projectHash, project, messages };
+  return { sessionIdHint, projectHash, project, messages, usage: usage.map((item) => ({ ...item, project })) };
 }
 
 function fileToSessionId(root: string, filePath: string, hint: string | null, projectHash: string | null): string {
@@ -214,6 +257,7 @@ export function syncGeminiSessions(
     const parsed = parseGeminiFile(filePath, stat);
     const sessionId = fileToSessionId(root, filePath, parsed.sessionIdHint, parsed.projectHash);
     const messages = parsed.messages;
+    const usage = parsed.usage;
 
     if (messages.length === 0) {
       stats.warnings += 1;
@@ -260,6 +304,15 @@ export function syncGeminiSessions(
       insertMessage.run(msg.id, msg.session_id, msg.role, msg.ts, msg.content, msg.turn_index, msg.seq_in_session);
       insertFts.run(msg.id, msg.session_id, msg.role, msg.content);
     }
+
+    replaceSessionUsage(
+      sessionId,
+      usage.map((record) => ({
+        ...record,
+        session_id: sessionId,
+        project: parsed.project,
+      }))
+    );
 
     upsertState.run(filePath, Math.floor(stat.mtimeMs), stat.size, now);
     stats.updatedSessions += 1;

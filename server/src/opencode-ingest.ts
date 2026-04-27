@@ -6,7 +6,8 @@ import Database from "better-sqlite3";
 import { db, nowIso } from "./db.js";
 import { buildSessionMetadataWithOptions } from "./summary-provider.js";
 import { getSummarySettings } from "./settings.js";
-import type { ChatRole, MessageRecord, SyncProgress, SyncStats } from "./types.js";
+import type { ChatRole, MessageRecord, SyncProgress, SyncStats, UsageInput } from "./types.js";
+import { replaceSessionUsage } from "./usage.js";
 
 type OpencodeSessionRow = {
   id: string;
@@ -35,6 +36,7 @@ type ParsedOpencodeSession = {
   project: string | null;
   messages: MessageRecord[];
   title: string;
+  usage: UsageInput[];
 };
 
 function opencodeDbPath(): string {
@@ -73,6 +75,23 @@ function parsePartContent(raw: string): { type: string; text: string; tool: stri
   } catch {
     return { type: "", text: "", tool: "" };
   }
+}
+
+function parseMessageData(raw: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function asUsageNumber(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
 }
 
 function parseMessageRole(raw: string): ChatRole {
@@ -159,10 +178,12 @@ function parseSessionMessages(
   }
 
   const extracted: Array<{ role: ChatRole; ts: string; content: string }> = [];
+  const usage: UsageInput[] = [];
   let turn = 0;
 
   for (const msg of messageRows.sort((a, b) => a.time_created - b.time_created)) {
-    const role = parseMessageRole(msg.data);
+    const parsedMessage = parseMessageData(msg.data);
+    const role = normalizeRole(parsedMessage?.role);
     const parts = partsByMessage.get(msg.id) ?? [];
     const texts: string[] = [];
     const tools: string[] = [];
@@ -179,6 +200,39 @@ function parseSessionMessages(
     }
 
     const ts = parseEpochMillis(msg.time_created);
+    const tokens = (parsedMessage?.tokens ?? null) as Record<string, unknown> | null;
+    if (role === "assistant" && tokens) {
+      const cache = (tokens.cache ?? null) as Record<string, unknown> | null;
+      const inputTokens = asUsageNumber(tokens.input);
+      const outputTokens = asUsageNumber(tokens.output);
+      const reasoningTokens = asUsageNumber(tokens.reasoning);
+      const cacheReadTokens = asUsageNumber(cache?.read);
+      const cacheWriteTokens = asUsageNumber(cache?.write);
+      const totalTokens =
+        asUsageNumber(tokens.total) || inputTokens + outputTokens + reasoningTokens + cacheReadTokens + cacheWriteTokens;
+      if (totalTokens > 0) {
+        usage.push({
+          session_id: "",
+          tool: "opencode",
+          project: session.directory?.trim() || null,
+          provider: typeof parsedMessage?.providerID === "string" ? parsedMessage.providerID : null,
+          model: typeof parsedMessage?.modelID === "string" ? parsedMessage.modelID : null,
+          record_type: "message",
+          source_type: "native_exact",
+          usage_semantics: "delta",
+          usage_time: ts,
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          reasoning_tokens: reasoningTokens,
+          cache_read_tokens: cacheReadTokens,
+          cache_write_tokens: cacheWriteTokens,
+          tool_tokens: 0,
+          total_tokens: totalTokens,
+          cost: typeof parsedMessage?.cost === "number" ? parsedMessage.cost : null,
+          raw_ref: `opencode:message:${msg.id}`,
+        });
+      }
+    }
     if (role === "user" && texts.length > 0) {
       turn += 1;
       extracted.push({ role: "user", ts, content: texts.join("\n\n") });
@@ -220,6 +274,7 @@ function parseSessionMessages(
     project: session.directory?.trim() || null,
     messages,
     title: normalizeOpencodeTitle(session.title, messages),
+    usage,
   };
 }
 
@@ -369,6 +424,15 @@ export function syncOpencodeSessions(
         insertMessage.run(msg.id, msg.session_id, msg.role, msg.ts, msg.content, msg.turn_index, msg.seq_in_session);
         insertFts.run(msg.id, msg.session_id, msg.role, msg.content);
       }
+
+      replaceSessionUsage(
+        sessionPk,
+        parsed.usage.map((record) => ({
+          ...record,
+          session_id: sessionPk,
+          project: parsed.project,
+        }))
+      );
 
       upsertState.run(sourcePath, session.time_updated, opencodeStateMarker(session, parsed.title, partRows.length), now);
       stats.updatedSessions += 1;

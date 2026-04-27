@@ -16,6 +16,8 @@ import {
 } from "./settings.js";
 import { testCodexSummaryConnection } from "./summary-provider.js";
 import { getSyncTaskState, startSyncTask } from "./sync-manager.js";
+import { computeUsageContributions } from "./usage.js";
+import type { UsageInput } from "./types.js";
 
 const app = Fastify({ logger: false });
 const port = Number(process.env.PORT ?? 8765);
@@ -42,6 +44,19 @@ type SessionEnriched = SessionRow & {
 
 const SESSION_SELECT_COLUMNS = `
   s.*,
+  u.usage_status,
+  u.provider AS usage_provider,
+  u.model AS usage_model,
+  u.input_tokens AS usage_input_tokens,
+  u.output_tokens AS usage_output_tokens,
+  u.reasoning_tokens AS usage_reasoning_tokens,
+  u.cache_read_tokens AS usage_cache_read_tokens,
+  u.cache_write_tokens AS usage_cache_write_tokens,
+  u.tool_tokens AS usage_tool_tokens,
+  u.total_tokens AS usage_total_tokens,
+  u.cost AS usage_cost,
+  u.record_count AS usage_record_count,
+  u.last_usage_time,
   (
     SELECT COUNT(*)
     FROM messages m
@@ -174,18 +189,47 @@ function parseCustomPurposeRules(raw: string): Array<{ label: string; re: RegExp
   return rules;
 }
 
-function sanitizeDisplayTitle(title: string, target: string): string {
-  const t = title.trim();
-  if (!t) return target || "Untitled Session";
+function isWeakDisplayTitle(value: string): boolean {
+  const t = value.replace(/\s+/g, " ").trim();
+  if (!t) return true;
   const lower = t.toLowerCase();
-  if (
+  return (
     lower.startsWith("<image name=") ||
     lower.startsWith("[image #") ||
     lower.startsWith("</image>") ||
     lower === "<instructions>" ||
-    lower === "<permissions instructions>"
-  ) {
-    return target ? `${target} 会话` : "Untitled Session";
+    lower === "<permissions instructions>" ||
+    lower.startsWith("# ") ||
+    lower.startsWith("## ") ||
+    lower.startsWith("<command-message") ||
+    lower.includes("instructions") ||
+    lower === "hello" ||
+    lower === "say hello" ||
+    lower === "你好" ||
+    lower === "你好，你是什么模型" ||
+    lower === "/status" ||
+    lower === "/status "
+  );
+}
+
+function headlineFromSummary(summary: string): string {
+  const s = summary.trim();
+  if (!s) return "";
+  const splitMatch = s.match(/^(.*?)\s*\|\s*(?:关键词|keywords)\s*[:：]/i);
+  if (splitMatch?.[1]) return splitMatch[1].trim();
+  if (/^(关键词|keywords)\s*[:：]/i.test(s)) return "";
+  return s;
+}
+
+function sanitizeDisplayTitle(title: string, target: string, purpose: string, summary: string): string {
+  const t = title.trim();
+  if (!t || isWeakDisplayTitle(t)) {
+    const cleanTarget = target && target !== "会话目标" ? target : "";
+    const cleanSummary = headlineFromSummary(summary);
+    if (cleanTarget && purpose) return `${cleanTarget}：${purpose}`;
+    if (cleanSummary) return cleanSummary.length > 90 ? `${cleanSummary.slice(0, 87)}...` : cleanSummary;
+    if (cleanTarget) return `${cleanTarget} 会话`;
+    return "Untitled Session";
   }
   return t;
 }
@@ -430,14 +474,15 @@ function withResumeHint(row: SessionRow, purposeSettings: PurposeSettings): Sess
   const savedPurpose = typeof row.session_purpose === "string" ? row.session_purpose.trim() : "";
   const savedTarget = typeof row.session_target === "string" ? row.session_target.trim() : "";
   const effectiveTarget = !savedTarget || savedTarget === "会话目标" ? inferred.session_target : savedTarget;
-  const displayTitle = sanitizeDisplayTitle(String(row.title ?? ""), effectiveTarget);
+  const effectivePurpose = savedPurpose || inferred.session_purpose;
+  const displayTitle = sanitizeDisplayTitle(String(row.title ?? ""), effectiveTarget, effectivePurpose, String(row.summary ?? ""));
   return {
     ...row,
     title: displayTitle,
     native_session_id: nativeSessionId,
     resume_command: hint.command,
     resume_label: hint.label,
-    session_purpose: savedPurpose || inferred.session_purpose,
+    session_purpose: effectivePurpose,
     session_target: effectiveTarget,
   };
 }
@@ -614,7 +659,11 @@ app.get("/api/sessions", async (request, reply) => {
     const rows = (await withDbRetry(() =>
       db
         .prepare(
-          `SELECT ${SESSION_SELECT_COLUMNS} FROM sessions s WHERE 1=1 ${toolClause} ORDER BY datetime(start_time) DESC LIMIT ? OFFSET ?`
+          `SELECT ${SESSION_SELECT_COLUMNS}
+           FROM sessions s
+           LEFT JOIN session_usage_summary u ON u.session_id = s.id
+           WHERE 1=1 ${toolClause}
+           ORDER BY datetime(start_time) DESC LIMIT ? OFFSET ?`
         )
         .all(...toolFilters, pageSize, offset)
     )) as SessionRow[];
@@ -656,6 +705,19 @@ app.get("/api/sessions", async (request, reply) => {
           s.session_purpose,
           s.session_target,
           s.message_count,
+          u.usage_status,
+          u.provider AS usage_provider,
+          u.model AS usage_model,
+          u.input_tokens AS usage_input_tokens,
+          u.output_tokens AS usage_output_tokens,
+          u.reasoning_tokens AS usage_reasoning_tokens,
+          u.cache_read_tokens AS usage_cache_read_tokens,
+          u.cache_write_tokens AS usage_cache_write_tokens,
+          u.tool_tokens AS usage_tool_tokens,
+          u.total_tokens AS usage_total_tokens,
+          u.cost AS usage_cost,
+          u.record_count AS usage_record_count,
+          u.last_usage_time,
           (
             SELECT COUNT(*)
             FROM messages m
@@ -666,6 +728,7 @@ app.get("/api/sessions", async (request, reply) => {
           f.role AS hit_role,
           substr(f.content, 1, 120) AS hit_excerpt
         FROM sessions s
+        LEFT JOIN session_usage_summary u ON u.session_id = s.id
         JOIN message_fts f ON f.session_id = s.id
         WHERE f.content MATCH ? ${toolClause}
         UNION ALL
@@ -684,6 +747,19 @@ app.get("/api/sessions", async (request, reply) => {
           s.session_purpose,
           s.session_target,
           s.message_count,
+          u.usage_status,
+          u.provider AS usage_provider,
+          u.model AS usage_model,
+          u.input_tokens AS usage_input_tokens,
+          u.output_tokens AS usage_output_tokens,
+          u.reasoning_tokens AS usage_reasoning_tokens,
+          u.cache_read_tokens AS usage_cache_read_tokens,
+          u.cache_write_tokens AS usage_cache_write_tokens,
+          u.tool_tokens AS usage_tool_tokens,
+          u.total_tokens AS usage_total_tokens,
+          u.cost AS usage_cost,
+          u.record_count AS usage_record_count,
+          u.last_usage_time,
           (
             SELECT COUNT(*)
             FROM messages m
@@ -697,6 +773,7 @@ app.get("/api/sessions", async (request, reply) => {
             1, 120
           ) AS hit_excerpt
         FROM sessions s
+        LEFT JOIN session_usage_summary u ON u.session_id = s.id
         WHERE (
           s.title LIKE ? ESCAPE '\\' OR
           s.summary LIKE ? ESCAPE '\\' OR
@@ -719,6 +796,19 @@ app.get("/api/sessions", async (request, reply) => {
         session_purpose,
         session_target,
         message_count,
+        usage_status,
+        usage_provider,
+        usage_model,
+        usage_input_tokens,
+        usage_output_tokens,
+        usage_reasoning_tokens,
+        usage_cache_read_tokens,
+        usage_cache_write_tokens,
+        usage_tool_tokens,
+        usage_total_tokens,
+        usage_cost,
+        usage_record_count,
+        last_usage_time,
         question_count,
         created_at,
         updated_at,
@@ -744,6 +834,19 @@ app.get("/api/sessions", async (request, reply) => {
         session_purpose,
         session_target,
         message_count,
+        usage_status,
+        usage_provider,
+        usage_model,
+        usage_input_tokens,
+        usage_output_tokens,
+        usage_reasoning_tokens,
+        usage_cache_read_tokens,
+        usage_cache_write_tokens,
+        usage_tool_tokens,
+        usage_total_tokens,
+        usage_cost,
+        usage_record_count,
+        last_usage_time,
         question_count,
         created_at,
         updated_at
@@ -801,6 +904,19 @@ app.get("/api/sessions", async (request, reply) => {
           s.session_purpose,
           s.session_target,
           s.message_count,
+          u.usage_status,
+          u.provider AS usage_provider,
+          u.model AS usage_model,
+          u.input_tokens AS usage_input_tokens,
+          u.output_tokens AS usage_output_tokens,
+          u.reasoning_tokens AS usage_reasoning_tokens,
+          u.cache_read_tokens AS usage_cache_read_tokens,
+          u.cache_write_tokens AS usage_cache_write_tokens,
+          u.tool_tokens AS usage_tool_tokens,
+          u.total_tokens AS usage_total_tokens,
+          u.cost AS usage_cost,
+          u.record_count AS usage_record_count,
+          u.last_usage_time,
           (
             SELECT COUNT(*)
             FROM messages m
@@ -811,6 +927,7 @@ app.get("/api/sessions", async (request, reply) => {
           f.role AS hit_role,
           substr(f.content, 1, 120) AS hit_excerpt
         FROM sessions s
+        LEFT JOIN session_usage_summary u ON u.session_id = s.id
         JOIN message_fts f ON f.session_id = s.id
         WHERE f.content MATCH ? ${roleFilter} ${toolClause}
       )
@@ -829,6 +946,19 @@ app.get("/api/sessions", async (request, reply) => {
         session_purpose,
         session_target,
         message_count,
+        usage_status,
+        usage_provider,
+        usage_model,
+        usage_input_tokens,
+        usage_output_tokens,
+        usage_reasoning_tokens,
+        usage_cache_read_tokens,
+        usage_cache_write_tokens,
+        usage_tool_tokens,
+        usage_total_tokens,
+        usage_cost,
+        usage_record_count,
+        last_usage_time,
         question_count,
         created_at,
         updated_at,
@@ -854,6 +984,19 @@ app.get("/api/sessions", async (request, reply) => {
         session_purpose,
         session_target,
         message_count,
+        usage_status,
+        usage_provider,
+        usage_model,
+        usage_input_tokens,
+        usage_output_tokens,
+        usage_reasoning_tokens,
+        usage_cache_read_tokens,
+        usage_cache_write_tokens,
+        usage_tool_tokens,
+        usage_total_tokens,
+        usage_cost,
+        usage_record_count,
+        last_usage_time,
         question_count,
         created_at,
         updated_at
@@ -888,6 +1031,218 @@ app.get("/api/sessions", async (request, reply) => {
   return { items: rows.map((row) => withResumeHint(row, purposeSettings)), total: total.c };
 });
 
+app.get("/api/usage/overview", async (request) => {
+  const toolsRaw = (request.query as Record<string, string | undefined>).tools?.trim() ?? "";
+  const days = Math.max(1, Number((request.query as Record<string, string | undefined>).days ?? "30"));
+  const toolFilters = toolsRaw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const toolClause =
+    toolFilters.length === 0 ? "" : `WHERE tool IN (${new Array(toolFilters.length).fill("?").join(",")})`;
+  const totals = (await withDbRetry(() =>
+    db
+      .prepare(
+        `SELECT
+          COUNT(*) AS sessions,
+          SUM(total_tokens) AS total_tokens,
+          SUM(input_tokens) AS input_tokens,
+          SUM(output_tokens) AS output_tokens,
+          SUM(reasoning_tokens) AS reasoning_tokens,
+          SUM(cache_read_tokens) AS cache_read_tokens,
+          SUM(cache_write_tokens) AS cache_write_tokens,
+          SUM(tool_tokens) AS tool_tokens,
+          SUM(cost) AS cost
+         FROM session_usage_summary ${toolClause}`
+      )
+      .get(...toolFilters)
+  )) as Record<string, number | null>;
+  const coverage = (await withDbRetry(() =>
+    db
+      .prepare(
+        `SELECT
+          COUNT(*) AS total_sessions,
+          SUM(CASE WHEN usage_status IS NOT NULL THEN 1 ELSE 0 END) AS covered_sessions
+         FROM sessions s
+         LEFT JOIN session_usage_summary u ON u.session_id = s.id ${
+           toolFilters.length === 0 ? "" : `WHERE s.tool IN (${new Array(toolFilters.length).fill("?").join(",")})`
+         }`
+      )
+      .get(...toolFilters)
+  )) as Record<string, number | null>;
+  const byTool = (await withDbRetry(() =>
+    db
+      .prepare(
+        `SELECT tool, COUNT(*) AS sessions, SUM(total_tokens) AS total_tokens, SUM(cost) AS cost
+         FROM session_usage_summary
+         ${toolClause}
+         GROUP BY tool
+         ORDER BY SUM(total_tokens) DESC`
+      )
+      .all(...toolFilters)
+  )) as Array<Record<string, unknown>>;
+  const recentRaw = (await withDbRetry(() =>
+    db
+      .prepare(
+        `SELECT
+          session_id, tool, project, provider, model, record_type, source_type, usage_semantics, usage_time,
+          input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, tool_tokens,
+          total_tokens, cost, raw_ref
+         FROM usage_records
+         WHERE usage_time >= datetime('now', ?) ${
+           toolFilters.length === 0 ? "" : `AND tool IN (${new Array(toolFilters.length).fill("?").join(",")})`
+         }
+         ORDER BY datetime(usage_time) ASC`
+      )
+      .all(`-${days} days`, ...toolFilters)
+  )) as UsageInput[];
+  const recentContrib = computeUsageContributions(recentRaw);
+  const recent = recentContrib.reduce(
+    (acc, record) => ({
+      total_tokens: acc.total_tokens + Number(record.total_tokens ?? 0),
+      cost: (acc.cost ?? 0) + Number(record.cost ?? 0),
+    }),
+    { total_tokens: 0, cost: 0 }
+  );
+
+  return {
+    ok: true,
+    totals,
+    recent,
+    byTool,
+    coverage: {
+      totalSessions: Number(coverage.total_sessions ?? 0),
+      coveredSessions: Number(coverage.covered_sessions ?? 0),
+    },
+  };
+});
+
+app.get("/api/usage/timeseries", async (request) => {
+  const days = Math.max(1, Math.min(365, Number((request.query as Record<string, string | undefined>).days ?? "30")));
+  const toolsRaw = (request.query as Record<string, string | undefined>).tools?.trim() ?? "";
+  const toolFilters = toolsRaw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const toolClause =
+    toolFilters.length === 0 ? "" : `AND tool IN (${new Array(toolFilters.length).fill("?").join(",")})`;
+  const raw = (await withDbRetry(() =>
+    db
+      .prepare(
+        `SELECT
+          session_id, tool, project, provider, model, record_type, source_type, usage_semantics, usage_time,
+          input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, tool_tokens,
+          total_tokens, cost, raw_ref
+         FROM usage_records
+         WHERE usage_time >= datetime('now', ?) ${toolClause}
+         ORDER BY datetime(usage_time) ASC`
+      )
+      .all(`-${days} days`, ...toolFilters)
+  )) as UsageInput[];
+  const contributions = computeUsageContributions(raw);
+  const dayMap = new Map<string, Record<string, unknown>>();
+  for (const record of contributions) {
+    const day = record.usage_time.slice(0, 10);
+    if (!day) continue;
+    const prev =
+      dayMap.get(day) ??
+      ({
+        day,
+        input_tokens: 0,
+        output_tokens: 0,
+        reasoning_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        tool_tokens: 0,
+        total_tokens: 0,
+        cost: 0,
+      } as Record<string, unknown>);
+    prev.input_tokens = Number(prev.input_tokens) + record.input_tokens;
+    prev.output_tokens = Number(prev.output_tokens) + record.output_tokens;
+    prev.reasoning_tokens = Number(prev.reasoning_tokens) + record.reasoning_tokens;
+    prev.cache_read_tokens = Number(prev.cache_read_tokens) + record.cache_read_tokens;
+    prev.cache_write_tokens = Number(prev.cache_write_tokens) + record.cache_write_tokens;
+    prev.tool_tokens = Number(prev.tool_tokens) + record.tool_tokens;
+    prev.total_tokens = Number(prev.total_tokens) + record.total_tokens;
+    prev.cost = Number(prev.cost) + Number(record.cost ?? 0);
+    dayMap.set(day, prev);
+  }
+  const rows = Array.from(dayMap.values()).sort((a, b) => String(a.day).localeCompare(String(b.day)));
+  return { ok: true, items: rows };
+});
+
+app.get("/api/usage/sessions", async (request) => {
+  const page = Math.max(1, Number((request.query as Record<string, string | undefined>).page ?? "1"));
+  const pageSize = Math.min(100, Math.max(1, Number((request.query as Record<string, string | undefined>).pageSize ?? "20")));
+  const toolsRaw = (request.query as Record<string, string | undefined>).tools?.trim() ?? "";
+  const sortBy = ((request.query as Record<string, string | undefined>).sortBy ?? "total_tokens").trim();
+  const offset = (page - 1) * pageSize;
+  const toolFilters = toolsRaw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const toolClause =
+    toolFilters.length === 0 ? "" : `WHERE s.tool IN (${new Array(toolFilters.length).fill("?").join(",")})`;
+  const orderClause =
+    sortBy === "start_time" ? "datetime(s.start_time) DESC" : sortBy === "cost" ? "COALESCE(u.cost, 0) DESC" : "COALESCE(u.total_tokens, 0) DESC";
+  const rows = (await withDbRetry(() =>
+    db
+      .prepare(
+        `SELECT ${SESSION_SELECT_COLUMNS}
+         FROM sessions s
+         LEFT JOIN session_usage_summary u ON u.session_id = s.id
+         ${toolClause}
+         ORDER BY ${orderClause}, datetime(s.start_time) DESC
+         LIMIT ? OFFSET ?`
+      )
+      .all(...toolFilters, pageSize, offset)
+  )) as SessionRow[];
+  const total = (await withDbRetry(() =>
+    db
+      .prepare(`SELECT COUNT(*) AS c FROM sessions s ${toolClause}`)
+      .get(...toolFilters)
+  )) as { c: number };
+  return { ok: true, items: rows.map((row) => withResumeHint(row, getPurposeSettings())), total: total.c };
+});
+
+app.get("/api/session/usage", async (request, reply) => {
+  const id = ((request.query as Record<string, string | undefined>).id ?? "").trim();
+  if (!id) {
+    reply.status(400);
+    return { error: "Missing id" };
+  }
+  const summary = (await withDbRetry(() =>
+    db.prepare("SELECT * FROM session_usage_summary WHERE session_id = ?").get(id)
+  )) as Record<string, unknown> | undefined;
+  const records = (await withDbRetry(() =>
+    db
+      .prepare(
+        `SELECT session_id, tool, project, provider, model, record_type, source_type, usage_semantics, usage_time, input_tokens, output_tokens,
+                reasoning_tokens, cache_read_tokens, cache_write_tokens, tool_tokens, total_tokens, cost, raw_ref
+         FROM usage_records
+         WHERE session_id = ?
+         ORDER BY datetime(usage_time) ASC`
+      )
+      .all(id)
+  )) as UsageInput[];
+  const contributions = computeUsageContributions(records);
+  const timelineMap = new Map<string, { day: string; total_tokens: number }>();
+  for (const item of contributions) {
+    const day = item.usage_time.slice(0, 10);
+    if (!day) continue;
+    const prev = timelineMap.get(day) ?? { day, total_tokens: 0 };
+    prev.total_tokens += item.total_tokens;
+    timelineMap.set(day, prev);
+  }
+  return {
+    ok: true,
+    summary: summary ?? null,
+    records,
+    contributions,
+    timeline: Array.from(timelineMap.values()).sort((a, b) => a.day.localeCompare(b.day)),
+  };
+});
+
 app.get("/api/session", async (request, reply) => {
   const id = ((request.query as Record<string, string | undefined>).id ?? "").trim();
   if (!id) {
@@ -896,7 +1251,9 @@ app.get("/api/session", async (request, reply) => {
   }
 
   const rawSession = (await withDbRetry(() =>
-    db.prepare(`SELECT ${SESSION_SELECT_COLUMNS} FROM sessions s WHERE s.id = ?`).get(id)
+    db
+      .prepare(`SELECT ${SESSION_SELECT_COLUMNS} FROM sessions s LEFT JOIN session_usage_summary u ON u.session_id = s.id WHERE s.id = ?`)
+      .get(id)
   )) as SessionRow | undefined;
   const session = rawSession ? withResumeHint(rawSession, getPurposeSettings()) : null;
   if (!session) {

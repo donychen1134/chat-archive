@@ -5,12 +5,14 @@ import crypto from "node:crypto";
 import { db, nowIso } from "./db.js";
 import { buildSessionMetadataWithOptions } from "./summary-provider.js";
 import { getSummarySettings } from "./settings.js";
-import type { ChatRole, MessageRecord, SyncProgress, SyncStats } from "./types.js";
+import type { ChatRole, MessageRecord, SyncProgress, SyncStats, UsageInput } from "./types.js";
+import { replaceSessionUsage } from "./usage.js";
 
 type ParsedCopilotFile = {
   sessionIdHint: string | null;
   project: string | null;
   messages: MessageRecord[];
+  usage: UsageInput[];
 };
 
 function copilotSessionsDir(): string {
@@ -68,6 +70,15 @@ function asText(input: unknown): string {
   return "";
 }
 
+function asUsageNumber(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
 function parseCopilotFile(filePath: string, stat: fs.Stats): ParsedCopilotFile {
   const raw = fs.readFileSync(filePath, "utf8");
   const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
@@ -75,6 +86,7 @@ function parseCopilotFile(filePath: string, stat: fs.Stats): ParsedCopilotFile {
   let sessionIdHint: string | null = null;
   let project: string | null = null;
   const extracted: Array<{ role: ChatRole; ts: string; content: string }> = [];
+  const usage: UsageInput[] = [];
 
   for (const line of lines) {
     try {
@@ -104,6 +116,68 @@ function parseCopilotFile(filePath: string, stat: fs.Stats): ParsedCopilotFile {
       if (type === "assistant.message") {
         const content = asText(data?.content).trimEnd();
         if (content) extracted.push({ role: "assistant", ts, content });
+        const outputTokens = asUsageNumber(data?.outputTokens);
+        const model = typeof data?.model === "string" ? data.model : null;
+        if (outputTokens > 0) {
+          usage.push({
+            session_id: "",
+            tool: "copilot",
+            project,
+            provider: "copilot",
+            model,
+            record_type: "message",
+            source_type: "native_partial",
+            usage_semantics: "delta",
+            usage_time: ts,
+            input_tokens: 0,
+            output_tokens: outputTokens,
+            reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            tool_tokens: 0,
+            total_tokens: outputTokens,
+            cost: null,
+            raw_ref: `copilot:assistant.output:${ts}:${usage.length}`,
+          });
+        }
+        continue;
+      }
+
+      if (type === "session.shutdown") {
+        const modelMetrics = (data?.modelMetrics ?? null) as Record<string, unknown> | null;
+        if (!modelMetrics) continue;
+        for (const [model, metric] of Object.entries(modelMetrics)) {
+          if (!metric || typeof metric !== "object") continue;
+          const usageObj = ((metric as Record<string, unknown>).usage ?? null) as Record<string, unknown> | null;
+          const requestsObj = ((metric as Record<string, unknown>).requests ?? null) as Record<string, unknown> | null;
+          if (!usageObj) continue;
+          const inputTokens = asUsageNumber(usageObj.inputTokens);
+          const outputTokens = asUsageNumber(usageObj.outputTokens);
+          const cacheReadTokens = asUsageNumber(usageObj.cacheReadTokens);
+          const cacheWriteTokens = asUsageNumber(usageObj.cacheWriteTokens);
+          const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+          if (totalTokens <= 0) continue;
+          usage.push({
+            session_id: "",
+            tool: "copilot",
+            project,
+            provider: "copilot",
+            model,
+            record_type: "session",
+            source_type: "native_partial",
+            usage_semantics: "session_total",
+            usage_time: ts,
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            reasoning_tokens: 0,
+            cache_read_tokens: cacheReadTokens,
+            cache_write_tokens: cacheWriteTokens,
+            tool_tokens: 0,
+            total_tokens: totalTokens,
+            cost: requestsObj ? asUsageNumber(requestsObj.cost) : null,
+            raw_ref: `copilot:session.shutdown:${model}:${ts}`,
+          });
+        }
       }
     } catch {
       // Keep ingest robust; malformed lines are skipped.
@@ -143,7 +217,7 @@ function parseCopilotFile(filePath: string, stat: fs.Stats): ParsedCopilotFile {
     } satisfies MessageRecord;
   });
 
-  return { sessionIdHint, project, messages };
+  return { sessionIdHint, project, messages, usage: usage.map((item) => ({ ...item, project })) };
 }
 
 function fileToSessionId(root: string, filePath: string, hint: string | null): string {
@@ -216,6 +290,7 @@ export function syncCopilotSessions(
     const parsed = parseCopilotFile(filePath, stat);
     const sessionId = fileToSessionId(root, filePath, parsed.sessionIdHint);
     const messages = parsed.messages;
+    const usage = parsed.usage;
 
     if (messages.length === 0) {
       stats.warnings += 1;
@@ -262,6 +337,15 @@ export function syncCopilotSessions(
       insertMessage.run(msg.id, msg.session_id, msg.role, msg.ts, msg.content, msg.turn_index, msg.seq_in_session);
       insertFts.run(msg.id, msg.session_id, msg.role, msg.content);
     }
+
+    replaceSessionUsage(
+      sessionId,
+      usage.map((record) => ({
+        ...record,
+        session_id: sessionId,
+        project: parsed.project,
+      }))
+    );
 
     upsertState.run(filePath, Math.floor(stat.mtimeMs), stat.size, now);
     stats.updatedSessions += 1;

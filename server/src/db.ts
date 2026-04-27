@@ -54,6 +54,53 @@ CREATE TABLE IF NOT EXISTS app_config (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS usage_records (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  tool TEXT NOT NULL,
+  project TEXT,
+  provider TEXT,
+  model TEXT,
+  record_type TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  usage_semantics TEXT NOT NULL DEFAULT 'delta',
+  usage_time TEXT NOT NULL,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+  tool_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  cost REAL,
+  raw_ref TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_usage_summary (
+  session_id TEXT PRIMARY KEY,
+  tool TEXT NOT NULL,
+  project TEXT,
+  provider TEXT,
+  model TEXT,
+  usage_status TEXT NOT NULL DEFAULT 'unavailable',
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+  tool_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  cost REAL,
+  record_count INTEGER NOT NULL DEFAULT 0,
+  last_usage_time TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
   message_id UNINDEXED,
   session_id UNINDEXED,
@@ -61,6 +108,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
   content
 );
 `);
+
+try {
+  db.exec(`ALTER TABLE usage_records ADD COLUMN usage_semantics TEXT NOT NULL DEFAULT 'delta'`);
+} catch {
+  // Column may already exist.
+}
 
 try {
   db.exec(`ALTER TABLE sessions ADD COLUMN summary_provider TEXT NOT NULL DEFAULT 'rule'`);
@@ -82,6 +135,14 @@ try {
 } catch {
   // Column may already exist.
 }
+
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_usage_records_session_id ON usage_records(session_id);
+CREATE INDEX IF NOT EXISTS idx_usage_records_usage_time ON usage_records(usage_time);
+CREATE INDEX IF NOT EXISTS idx_usage_records_tool ON usage_records(tool);
+CREATE INDEX IF NOT EXISTS idx_session_usage_summary_tool ON session_usage_summary(tool);
+CREATE INDEX IF NOT EXISTS idx_session_usage_summary_total_tokens ON session_usage_summary(total_tokens);
+`);
 
 export function nowIso(): string {
   return new Date().toISOString();

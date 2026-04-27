@@ -5,12 +5,14 @@ import crypto from "node:crypto";
 import { db, nowIso } from "./db.js";
 import { buildSessionMetadataWithOptions } from "./summary-provider.js";
 import { getSummarySettings } from "./settings.js";
-import type { ChatRole, MessageRecord, SyncProgress, SyncStats } from "./types.js";
+import type { ChatRole, MessageRecord, SyncProgress, SyncStats, UsageInput } from "./types.js";
+import { replaceSessionUsage } from "./usage.js";
 
 type ParsedClaudeFile = {
   sessionIdHint: string | null;
   project: string | null;
   messages: MessageRecord[];
+  usage: UsageInput[];
 };
 
 function claudeProjectsDir(): string {
@@ -93,10 +95,20 @@ function asClaudeText(content: unknown): string {
   return parts.join("\n");
 }
 
+function asUsageNumber(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
 function parseClaudeFile(filePath: string, stat: fs.Stats): ParsedClaudeFile {
   const raw = fs.readFileSync(filePath, "utf8");
   const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
   const extracted: Array<{ role: ChatRole; ts: string; content: string }> = [];
+  const usage: UsageInput[] = [];
   let project: string | null = null;
   let sessionIdHint: string | null = null;
 
@@ -109,12 +121,42 @@ function parseClaudeFile(filePath: string, stat: fs.Stats): ParsedClaudeFile {
       const message = (parsed.message ?? null) as Record<string, unknown> | null;
       const role = normalizeClaudeRole(type, message?.role);
       if (role !== "user" && role !== "assistant") continue;
+      const usageData = (message?.usage ?? null) as Record<string, unknown> | null;
 
       const content = asClaudeText(message?.content);
       if (!content.trim()) continue;
 
       const ts = parseTimestamp(parsed.timestamp, stat.mtime);
       extracted.push({ role, ts, content: content.trimEnd() });
+      if (usageData) {
+        const inputTokens = asUsageNumber(usageData.input_tokens);
+        const outputTokens = asUsageNumber(usageData.output_tokens);
+        const cacheCreate = asUsageNumber(usageData.cache_creation_input_tokens);
+        const cacheRead = asUsageNumber(usageData.cache_read_input_tokens);
+        const totalTokens = inputTokens + outputTokens + cacheCreate + cacheRead;
+        if (totalTokens > 0) {
+          usage.push({
+            session_id: "",
+            tool: "claude",
+            project,
+            provider: "anthropic",
+            model: typeof message?.model === "string" ? message.model : null,
+            record_type: "message",
+            source_type: "native_partial",
+            usage_semantics: "delta",
+            usage_time: ts,
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            reasoning_tokens: 0,
+            cache_read_tokens: cacheRead,
+            cache_write_tokens: cacheCreate,
+            tool_tokens: 0,
+            total_tokens: totalTokens,
+            cost: null,
+            raw_ref: `claude:message.usage:${ts}:${usage.length}`,
+          });
+        }
+      }
 
       if (!project && typeof parsed.cwd === "string" && parsed.cwd.trim().length > 0) {
         project = parsed.cwd.trim();
@@ -160,7 +202,7 @@ function parseClaudeFile(filePath: string, stat: fs.Stats): ParsedClaudeFile {
     } satisfies MessageRecord;
   });
 
-  return { sessionIdHint, project, messages };
+  return { sessionIdHint, project, messages, usage: usage.map((item) => ({ ...item, project })) };
 }
 
 function fileToSessionId(root: string, filePath: string, hint: string | null): string {
@@ -233,6 +275,7 @@ export function syncClaudeSessions(
     const parsed = parseClaudeFile(filePath, stat);
     const sessionId = fileToSessionId(root, filePath, parsed.sessionIdHint);
     const messages = parsed.messages;
+    const usage = parsed.usage;
 
     if (messages.length === 0) {
       stats.warnings += 1;
@@ -279,6 +322,15 @@ export function syncClaudeSessions(
       insertMessage.run(msg.id, msg.session_id, msg.role, msg.ts, msg.content, msg.turn_index, msg.seq_in_session);
       insertFts.run(msg.id, msg.session_id, msg.role, msg.content);
     }
+
+    replaceSessionUsage(
+      sessionId,
+      usage.map((record) => ({
+        ...record,
+        session_id: sessionId,
+        project: parsed.project,
+      }))
+    );
 
     upsertState.run(filePath, Math.floor(stat.mtimeMs), stat.size, now);
     stats.updatedSessions += 1;

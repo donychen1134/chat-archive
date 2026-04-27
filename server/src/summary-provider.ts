@@ -98,6 +98,18 @@ function normalizeCodexError(detail: string): string {
 
 function sanitizeTitle(value: string): string {
   const line = value.split("\n").find((v) => v.trim().length > 0)?.trim() ?? "未命名会话";
+  const lower = line.toLowerCase();
+  if (
+    lower.startsWith("# ") ||
+    lower.startsWith("## ") ||
+    lower.startsWith("<command-message") ||
+    lower.includes("instructions") ||
+    lower === "hello" ||
+    lower === "say hello" ||
+    lower === "你好"
+  ) {
+    return "";
+  }
   return line.length > 90 ? `${line.slice(0, 87)}...` : line;
 }
 

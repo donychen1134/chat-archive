@@ -42,3 +42,29 @@ export interface SyncProgress {
   currentFile: string;
   warningDetails: string[];
 }
+
+export type UsageRecordType = "message" | "turn" | "session";
+export type UsageSourceType = "native_exact" | "native_partial";
+export type UsageStatus = "exact" | "partial" | "unavailable";
+export type UsageSemantics = "delta" | "snapshot" | "session_total";
+
+export interface UsageInput {
+  session_id: string;
+  tool: string;
+  project: string | null;
+  provider: string | null;
+  model: string | null;
+  record_type: UsageRecordType;
+  source_type: UsageSourceType;
+  usage_semantics: UsageSemantics;
+  usage_time: string;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  tool_tokens: number;
+  total_tokens: number;
+  cost: number | null;
+  raw_ref: string;
+}
