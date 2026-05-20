@@ -1,6 +1,6 @@
 import { db, nowIso } from "./db.js";
 
-export type SummaryProvider = "codex" | "qwen" | "rule" | "hybrid";
+export type SummaryProvider = "codex" | "qwen" | "friday" | "rule" | "hybrid";
 export type PurposeKey = "code_review" | "troubleshooting" | "development" | "understanding" | "consulting";
 
 export interface SummarySettings {
@@ -27,6 +27,7 @@ const DEFAULTS: SummarySettings = {
     if (raw === "rule") return "rule";
     if (raw === "hybrid") return "hybrid";
     if (raw === "qwen") return "qwen";
+    if (raw === "friday") return "friday";
     return "codex";
   })(),
   model: process.env.CHAT_ARCHIVE_SUMMARY_MODEL ?? "gpt-5-codex",
@@ -70,7 +71,16 @@ function getNumber(key: string, fallback: number): number {
 export function getSummarySettings(): SummarySettings {
   const provider = getString("summary.provider", DEFAULTS.provider);
   return {
-    provider: provider === "rule" ? "rule" : provider === "hybrid" ? "hybrid" : provider === "qwen" ? "qwen" : "codex",
+    provider:
+      provider === "rule"
+        ? "rule"
+        : provider === "hybrid"
+          ? "hybrid"
+          : provider === "qwen"
+            ? "qwen"
+            : provider === "friday"
+              ? "friday"
+              : "codex",
     model: getString("summary.model", DEFAULTS.model),
     timeoutMs: getNumber("summary.timeout_ms", DEFAULTS.timeoutMs),
     codexLimitPerRun: getNumber("summary.codex_limit_per_run", DEFAULTS.codexLimitPerRun),
@@ -88,9 +98,11 @@ export function setSummarySettings(input: Partial<SummarySettings>): SummarySett
           ? "hybrid"
           : input.provider === "qwen"
             ? "qwen"
-            : input.provider === "codex"
-              ? "codex"
-              : current.provider,
+            : input.provider === "friday"
+              ? "friday"
+              : input.provider === "codex"
+                ? "codex"
+                : current.provider,
     model: input.model?.trim() ? input.model.trim() : current.model,
     timeoutMs:
       typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0
@@ -116,6 +128,28 @@ export function setSummarySettings(input: Partial<SummarySettings>): SummarySett
 export function setSummaryLastError(message: string): void {
   const now = nowIso();
   upsertStmt.run("summary.last_error", message.slice(0, 500), now);
+}
+
+export function getFridayAppId(): string {
+  return (
+    process.env.CHAT_ARCHIVE_FRIDAY_APP_ID ??
+    process.env.FRIDAY_APP_ID ??
+    getString("friday.app_id", "")
+  ).trim();
+}
+
+export function getFridayTenantId(): string {
+  return (
+    process.env.CHAT_ARCHIVE_FRIDAY_TENANT_ID ??
+    process.env.FRIDAY_TENANT_ID ??
+    getString("friday.tenant_id", "")
+  ).trim();
+}
+
+export function setFridayCredentials(input: { appId?: string; tenantId?: string }): void {
+  const now = nowIso();
+  if (input.appId?.trim()) upsertStmt.run("friday.app_id", input.appId.trim(), now);
+  if (input.tenantId?.trim()) upsertStmt.run("friday.tenant_id", input.tenantId.trim(), now);
 }
 
 export function getPurposeSettings(): PurposeSettings {

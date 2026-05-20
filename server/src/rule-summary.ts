@@ -99,6 +99,71 @@ function normalizedLine(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function trimTitle(value: string, max = 50): string {
+  const title = normalizedLine(value).replace(/[。；;，,：:、\s]+$/g, "");
+  if (title.length <= max) return title;
+
+  const parts = title
+    .split(/[。；;，,：:\n]/)
+    .map((part) => normalizedLine(part))
+    .filter((part) => part.length >= 4);
+  const fitting = parts.find((part) => part.length <= max);
+  if (fitting) return fitting;
+
+  return `${title.slice(0, max - 3)}...`;
+}
+
+function replaceKnownUrls(value: string): string {
+  return value
+    .replace(/https?:\/\/tt\.sankuai\.com\/[^\s，,。；;]+/gi, "TT 工单")
+    .replace(/https?:\/\/km\.sankuai\.com\/[^\s，,。；;]+/gi, "学城文档")
+    .replace(/https?:\/\/ones\.sankuai\.com\/[^\s，,。；;]+/gi, "ONES 工作项")
+    .replace(/https?:\/\/[^\s，,。；;]+/gi, "");
+}
+
+function stripRequestShell(value: string): string {
+  let title = replaceKnownUrls(normalizedLine(value));
+  title = title
+    .replace(/^(?:请|麻烦|帮忙|帮我|帮|给我|能否|可以)?\s*(?:用|使用)\s+[^，,。；;]{1,60}?\s+skill[，,、\s]*/i, "")
+    .replace(/^(?:请|麻烦|帮忙|帮我|帮|给我|能否|可以)\s*/i, "")
+    .replace(/^(?:看一下|看下|看看|读一下|读取|读这个|分析一下|分析下)\s*/i, "")
+    .replace(/^(?:当前|这个|下面|如下)\s*/i, "")
+    .replace(/\s+mis\s+\w+$/i, "")
+    .replace(/父文档\s*\d+/g, "")
+    .replace(/群聊\s*(\d{6,})/g, "群聊 $1");
+
+  if (/TT 工单/.test(title) && /读|看|分析|总结|详情/.test(value)) return "TT 工单分析";
+  if (/学城文档/.test(title) && /写入|创建|发布/.test(value)) return trimTitle(title.replace(/将|把|文档/g, ""), 50);
+  if (/学城文档/.test(title)) return "学城文档阅读";
+  if (/ONES 工作项/.test(title)) return "ONES 工作项分析";
+  if (/写入.*学城|发布.*学城/.test(title)) {
+    const file = title.match(/[A-Za-z0-9_.-]+\.(?:md|markdown|txt|docx?)/i)?.[0];
+    return file ? trimTitle(`${file} 写入学城`) : "文档写入学城";
+  }
+  if (/pod/i.test(title) && /调度/.test(title) && /原因|没被调度|失败/.test(title)) return "Pod 调度结果差异原因分析";
+  if (/java/i.test(title) && /报错|异常|error/i.test(title)) return "Java 程序报错分析";
+
+  const colonIndex = title.search(/[：:]/);
+  if (colonIndex > 6) {
+    const before = title.slice(0, colonIndex);
+    if (/报错|错误|异常|分析|排查|原因/.test(before)) title = before;
+  }
+
+  title = title
+    .replace(/^(?:我的|当前目录下|当前目录|下面两个|下面)\s*/i, "")
+    .replace(/的话/g, "")
+    .replace(/是什么原因/g, "原因分析")
+    .replace(/找原因/g, "原因分析")
+    .replace(/帮我分析/g, "分析")
+    .replace(/分析下/g, "分析")
+    .replace(/分析一下/g, "分析")
+    .replace(/帮我总结/g, "总结")
+    .replace(/帮我看看/g, "")
+    .replace(/看原因/g, "原因分析");
+
+  return trimTitle(title);
+}
+
 function isWeakTitleLine(value: string): boolean {
   const line = normalizedLine(value);
   if (!line) return true;
@@ -132,11 +197,11 @@ function pickBestTitle(messages: MessageRecord[]): string {
       .map((line) => normalizedLine(line))
       .filter(Boolean);
     for (const line of lines) {
-      if (!isWeakTitleLine(line)) return line;
+      if (!isWeakTitleLine(line)) return stripRequestShell(line);
     }
   }
   const fallback = normalizedLine(userMessages[0]?.content.split("\n").find((line) => line.trim().length > 0) ?? "");
-  return fallback || "未命名会话";
+  return fallback ? stripRequestShell(fallback) : "未命名会话";
 }
 
 function topKeywords(text: string, max = 4): string[] {
@@ -162,7 +227,7 @@ export function buildTitleAndSummary(messages: MessageRecord[]): { title: string
   const effective = effectiveMessages(messages);
   const titleSource = effective.length > 0 ? effective : messages.filter((m) => m.role === "user" || m.role === "assistant");
   const firstLine = pickBestTitle(titleSource);
-  const title = firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine;
+  const title = trimTitle(firstLine);
 
   const joined = (effective.length > 0 ? effective : messages.filter((m) => m.role === "user" || m.role === "assistant"))
     .slice(0, 12)

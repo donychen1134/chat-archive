@@ -1,27 +1,87 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import type { MessageRecord } from "./types.js";
 import { buildTitleAndSummary } from "./rule-summary.js";
-import { getSummarySettings, setSummaryLastError, type SummaryProvider } from "./settings.js";
+import { getFridayAppId, getSummarySettings, setSummaryLastError, type SummaryProvider } from "./settings.js";
 
 export type SummaryResult = {
   title: string;
   summary: string;
+  purpose: string;
+  target: string;
+  outcome: string;
+  keywords: string[];
+  entities: Array<{ type: string; value: string }>;
   providerUsed: SummaryProvider;
   status: string;
 };
+
+export type CachedSummaryRecord = {
+  title?: string | null;
+  summary?: string | null;
+  summary_provider?: string | null;
+  summary_status?: string | null;
+  session_purpose?: string | null;
+  session_target?: string | null;
+  session_outcome?: string | null;
+  keywords_json?: string | null;
+  entities_json?: string | null;
+  summary_content_hash?: string | null;
+  summary_model?: string | null;
+  summary_prompt_version?: number | null;
+  end_time?: string | null;
+};
+
+export type SyncSummaryResult = SummaryResult & {
+  contentHash: string;
+  model: string;
+  promptVersion: number;
+  fromCache: boolean;
+};
+
+export const SUMMARY_PROMPT_VERSION = 3;
 
 let codexCircuitUntilMs = 0;
 let codexCircuitReason = "";
 let codexConsecutiveFailures = 0;
 
-function pickEffectiveMessages(messages: MessageRecord[]): MessageRecord[] {
+function isBoilerplate(text: string): boolean {
+  const value = text.toLowerCase();
+  return (
+    value.includes("<permissions instructions>") ||
+    value.includes("<instructions>") ||
+    value.includes("# agents.md instructions") ||
+    value.includes("<environment_context>") ||
+    value.includes("<collaboration_mode>") ||
+    value.includes("<cwd>") ||
+    value.includes("</cwd>") ||
+    value.includes("<user_shell_command>") ||
+    value.includes("approved command prefix saved")
+  );
+}
+
+function effectiveMessages(messages: MessageRecord[]): MessageRecord[] {
   return messages
     .filter((m) => m.role === "user" || m.role === "assistant")
     .filter((m) => m.content.trim().length > 0)
-    .slice(0, 24);
+    .filter((m) => !isBoilerplate(m.content));
+}
+
+function pickEffectiveMessages(messages: MessageRecord[]): MessageRecord[] {
+  const effective = effectiveMessages(messages);
+  if (effective.length <= 18) return effective;
+  const first = effective.slice(0, 6);
+  const last = effective.slice(-12);
+  const seen = new Set<string>();
+  return [...first, ...last].filter((m) => {
+    const key = m.id || `${m.role}:${m.ts}:${m.content.slice(0, 80)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function conversationForPrompt(messages: MessageRecord[]): string {
@@ -29,6 +89,13 @@ function conversationForPrompt(messages: MessageRecord[]): string {
     .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
     .join("\n\n")
     .slice(0, 12000);
+}
+
+export function summaryContentHash(messages: MessageRecord[]): string {
+  const content = effectiveMessages(messages)
+    .map((m) => `${m.role}\u0000${m.content}`)
+    .join("\u0001");
+  return crypto.createHash("sha256").update(content).digest("hex");
 }
 
 function parseFirstJsonObject(raw: string): Record<string, unknown> | null {
@@ -113,23 +180,163 @@ function sanitizeTitle(value: string): string {
   return line.length > 90 ? `${line.slice(0, 87)}...` : line;
 }
 
-function parseMetadataObject(raw: string): { title: string; summary: string } | null {
+function cleanText(value: unknown, max: number): string {
+  if (typeof value !== "string") return "";
+  const text = value.replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+function cleanStringArray(value: unknown, maxItems: number, maxLen: number): string[] {
+  if (!Array.isArray(value)) return [];
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    const text = cleanText(item, maxLen);
+    if (!text) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
+function cleanEntities(value: unknown): Array<{ type: string; value: string }> {
+  if (!Array.isArray(value)) return [];
+  const result: Array<{ type: string; value: string }> = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const obj = item as Record<string, unknown>;
+    const type = cleanText(obj.type, 32).toLowerCase() || "topic";
+    const entityValue = cleanText(obj.value, 120);
+    if (!entityValue) continue;
+    const key = `${type}:${entityValue.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ type, value: entityValue });
+    if (result.length >= 12) break;
+  }
+  return result;
+}
+
+function parseKeywordsFromSummary(summary: string): string[] {
+  const m = summary.match(/(?:关键词|keywords)\s*[:：]\s*(.+)$/i);
+  if (!m?.[1]) return [];
+  return m[1]
+    .split(/[、,，|]/)
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function parseJsonArray(raw: string | null | undefined): unknown[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function providerFromCache(value: string | null | undefined): SummaryProvider {
+  return value === "codex" || value === "qwen" || value === "friday" || value === "hybrid" || value === "rule"
+    ? value
+    : "rule";
+}
+
+function cachedRecordToSummary(existing: CachedSummaryRecord, statusPrefix: string): SummaryResult | null {
+  const title = sanitizeTitle(existing.title ?? "");
+  const summary = cleanText(existing.summary ?? "", 500);
+  if (!title || !summary) return null;
+  const status = cleanText(existing.summary_status ?? "", 420);
+  return {
+    title,
+    summary,
+    purpose: cleanText(existing.session_purpose ?? "", 48),
+    target: cleanText(existing.session_target ?? "", 120),
+    outcome: cleanText(existing.session_outcome ?? "", 500),
+    keywords: cleanStringArray(parseJsonArray(existing.keywords_json), 8, 48),
+    entities: cleanEntities(parseJsonArray(existing.entities_json)),
+    providerUsed: providerFromCache(existing.summary_provider),
+    status: `${statusPrefix}${status ? `:${status}` : ""}`.slice(0, 500),
+  };
+}
+
+function canUseStrongCache(existing: CachedSummaryRecord, provider: SummaryProvider): boolean {
+  const status = (existing.summary_status ?? "").toLowerCase();
+  if (status.startsWith("fallback_rule")) return false;
+  const cachedProvider = providerFromCache(existing.summary_provider);
+  if (cachedProvider === "rule" && provider !== "rule") return false;
+  return true;
+}
+
+function activeWindowMs(): number {
+  const hours = Number(process.env.CHAT_ARCHIVE_SUMMARY_ACTIVE_HOURS ?? "24");
+  if (!Number.isFinite(hours) || hours < 0) return 24 * 60 * 60 * 1000;
+  return hours * 60 * 60 * 1000;
+}
+
+function isActiveSession(endTime: string | null | undefined): boolean {
+  const windowMs = activeWindowMs();
+  if (windowMs === 0) return false;
+  const ts = endTime ? new Date(endTime).valueOf() : Date.now();
+  if (!Number.isFinite(ts)) return true;
+  return Date.now() - ts <= windowMs;
+}
+
+function parseMetadataObject(raw: string): Omit<SummaryResult, "providerUsed" | "status"> | null {
   const obj = parseFirstJsonObject(raw);
   if (!obj) return null;
   const titleRaw = typeof obj.title === "string" ? obj.title : "";
   const summaryRaw = typeof obj.summary === "string" ? obj.summary : "";
-  const keywordsRaw = Array.isArray(obj.keywords)
-    ? obj.keywords.filter((k): k is string => typeof k === "string").slice(0, 5)
-    : [];
   const title = sanitizeTitle(titleRaw);
   if (!title) return null;
-  const summaryText = summaryRaw.trim();
-  const keywords = keywordsRaw.join(", ");
-  const summary =
-    summaryText && keywords
-      ? `${summaryText} | 关键词: ${keywords}`
-      : summaryText || (keywords ? `关键词: ${keywords}` : "暂未提炼出会话摘要。");
-  return { title, summary };
+  const summary = cleanText(summaryRaw, 500) || "暂未提炼出会话摘要。";
+  const keywords = cleanStringArray(obj.keywords, 8, 48);
+  return {
+    title,
+    summary,
+    purpose: cleanText(obj.purpose, 48),
+    target: cleanText(obj.target, 120),
+    outcome: cleanText(obj.outcome, 500),
+    keywords,
+    entities: cleanEntities(obj.entities),
+  };
+}
+
+function withRuleMetadata(base: { title: string; summary: string }): Omit<SummaryResult, "providerUsed" | "status"> {
+  return {
+    title: base.title,
+    summary: base.summary,
+    purpose: "",
+    target: "",
+    outcome: "",
+    keywords: parseKeywordsFromSummary(base.summary),
+    entities: [],
+  };
+}
+
+function metadataPrompt(content: string): string {
+  return [
+    "你在为一个 AI 编程会话生成用于归档、检索和列表展示的结构化元信息。",
+    "只返回严格 JSON，键必须是：title, summary, purpose, target, outcome, keywords, entities。",
+    "字段要求：",
+    "- title：单行，不超过 50 字，使用用户主要语言，像 opencode title 一样自然可检索；不要出现工具名、总结/生成等字样。",
+    "- summary：1-2 句，具体说明用户要解决什么，以及会话中做了什么或得到了什么结论。",
+    "- purpose：短标签，例如 功能开发、问题排查、代码评审、代码理解、文档写作、方案设计、运维查询、问题咨询。",
+    "- target：主要对象，例如 repo、模块、文件、服务、pod、接口、文档、脚本、错误名；不要填泛词。",
+    "- outcome：最终状态或结论；如果会话没有完成，说明当前停在什么问题上。",
+    "- keywords：3-8 个关键词数组，优先保留精确技术词、错误、文件名、服务名；避免 codex/claude/skill/repo/instruction/session 等泛词。",
+    "- entities：数组，每项为 {type,value}；type 可用 repo,file,service,error,command,api,pod,doc,topic。",
+    "- 忽略 system/developer/tool 噪声，优先依据真实用户意图、关键 assistant 结论和最后状态。",
+    "- 不要返回 markdown。",
+    "会话内容：",
+    content,
+  ].join("\n");
 }
 
 function qwenApiUrl(): string {
@@ -140,6 +347,12 @@ function qwenApiUrl(): string {
 
 function qwenApiKey(): string {
   return (process.env.CHAT_ARCHIVE_QWEN_API_KEY ?? process.env.DASHSCOPE_API_KEY ?? process.env.QWEN_API_KEY ?? "").trim();
+}
+
+function fridayApiUrl(): string {
+  const base = (process.env.CHAT_ARCHIVE_FRIDAY_BASE_URL ?? "https://aigc.sankuai.com/v1/openai/native").trim();
+  if (base.endsWith("/chat/completions")) return base;
+  return `${base.replace(/\/+$/, "")}/chat/completions`;
 }
 
 function normalizeQwenModel(input: string): string {
@@ -161,17 +374,7 @@ function buildQwenSummary(
     return { result: null, error: "missing qwen api key: set CHAT_ARCHIVE_QWEN_API_KEY or DASHSCOPE_API_KEY" };
   }
 
-  const prompt = [
-    "你在为一个编程会话生成元信息。",
-    "只返回严格 JSON，键必须是：title, summary, keywords。",
-    "要求：",
-    "- title：不超过 80 字，聚焦用户真实意图，不要模板化措辞。",
-    "- summary：一句简短中文总结，具体、贴近主题。",
-    "- keywords：3-5 个关键词数组，优先中文；避免 skill/repo/prompt/instruction/code 等泛词。",
-    "- 不要返回 markdown。",
-    "会话内容：",
-    content,
-  ].join("\n");
+  const prompt = metadataPrompt(content);
 
   const reqBody = JSON.stringify({
     model: normalizeQwenModel(model),
@@ -228,10 +431,86 @@ function buildQwenSummary(
   if (!parsed) return { result: null, error: "qwen output is not valid JSON object" };
   return {
     result: {
-      title: parsed.title,
-      summary: parsed.summary,
+      ...parsed,
       providerUsed: "qwen",
       status: "qwen_ok",
+    },
+    error: "",
+  };
+}
+
+function buildFridaySummary(
+  messages: MessageRecord[],
+  model: string,
+  timeoutMs: number
+): { result: SummaryResult | null; error: string } {
+  const content = conversationForPrompt(messages);
+  if (!content) return { result: null, error: "empty conversation" };
+  const appId = getFridayAppId();
+  if (!appId) {
+    return { result: null, error: "missing friday app id: set CHAT_ARCHIVE_FRIDAY_APP_ID or app_config friday.app_id" };
+  }
+
+  const prompt = metadataPrompt(content);
+  const reqBody = JSON.stringify({
+    model: model.trim() || "gpt-4.1-nano",
+    temperature: 0.2,
+    stream: false,
+    messages: [
+      { role: "system", content: "你只输出严格 JSON，且内容使用简体中文。" },
+      { role: "user", content: prompt },
+    ],
+  });
+
+  const result = spawnSync(
+    "curl",
+    [
+      "-sS",
+      "--max-time",
+      String(Math.max(3, Math.ceil(timeoutMs / 1000))),
+      "-X",
+      "POST",
+      fridayApiUrl(),
+      "-H",
+      "Content-Type: application/json",
+      "-H",
+      `Authorization: Bearer ${appId}`,
+      "-d",
+      reqBody,
+    ],
+    {
+      encoding: "utf8",
+      timeout: timeoutMs + 1000,
+      maxBuffer: 4 * 1024 * 1024,
+      env: { ...process.env },
+    }
+  );
+
+  if (result.status !== 0) {
+    return { result: null, error: tail(result.stderr || result.stdout || `friday curl exit ${String(result.status)}`) };
+  }
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(result.stdout || "{}") as Record<string, unknown>;
+  } catch {
+    return { result: null, error: `friday returned non-json response: ${tail(result.stdout || result.stderr || "", 240)}` };
+  }
+  if (payload.error && typeof (payload.error as Record<string, unknown>).message === "string") {
+    return { result: null, error: `friday api error: ${String((payload.error as Record<string, unknown>).message)}` };
+  }
+
+  const contentText =
+    (((payload.choices as Array<Record<string, unknown>> | undefined)?.[0]?.message as Record<string, unknown> | undefined)?.content as
+      | string
+      | undefined) ?? "";
+  const parsed = parseMetadataObject(contentText);
+  if (!parsed) return { result: null, error: "friday output is not valid JSON object" };
+  return {
+    result: {
+      ...parsed,
+      providerUsed: "friday",
+      status: "friday_ok",
     },
     error: "",
   };
@@ -258,17 +537,7 @@ function buildCodexSummary(
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "chat-archive-summary-"));
   const outFile = path.join(tmp, "last.txt");
 
-  const prompt = [
-    "你在为一个编程会话生成元信息。",
-    "只返回严格 JSON，键必须是：title, summary, keywords。",
-    "要求：",
-    "- title：不超过 80 字，聚焦用户真实意图，不要模板化措辞。",
-    "- summary：一句简短中文总结，具体、贴近主题。",
-    "- keywords：3-5 个关键词数组，优先中文；避免 skill/repo/prompt/instruction/code 等泛词。",
-    "- 不要返回 markdown。",
-    "会话内容：",
-    content,
-  ].join("\n");
+  const prompt = metadataPrompt(content);
 
   const runCodex = (withOutputFile: boolean) =>
     spawnSync(
@@ -351,8 +620,7 @@ function buildCodexSummary(
   codexConsecutiveFailures = 0;
   return {
     result: {
-      title: parsed.title,
-      summary: parsed.summary,
+      ...parsed,
       providerUsed: "codex",
       status: "codex_ok",
     },
@@ -371,7 +639,7 @@ export function buildSessionMetadataWithOptions(
   const settings = getSummarySettings();
   const provider = settings.provider;
   if (provider === "rule") {
-    const base = buildTitleAndSummary(messages);
+    const base = withRuleMetadata(buildTitleAndSummary(messages));
     return { ...base, providerUsed: "rule", status: "rule_only" };
   }
 
@@ -382,7 +650,7 @@ export function buildSessionMetadataWithOptions(
       return byQwen.result;
     }
     setSummaryLastError(byQwen.error);
-    const fallback = buildTitleAndSummary(messages);
+    const fallback = withRuleMetadata(buildTitleAndSummary(messages));
     return {
       ...fallback,
       providerUsed: "rule",
@@ -390,8 +658,23 @@ export function buildSessionMetadataWithOptions(
     };
   }
 
+  if (provider === "friday") {
+    const byFriday = buildFridaySummary(messages, settings.model, settings.timeoutMs);
+    if (byFriday.result) {
+      setSummaryLastError("");
+      return byFriday.result;
+    }
+    setSummaryLastError(byFriday.error);
+    const fallback = withRuleMetadata(buildTitleAndSummary(messages));
+    return {
+      ...fallback,
+      providerUsed: "rule",
+      status: `fallback_rule:${byFriday.error || "unknown error"}`,
+    };
+  }
+
   if (provider === "hybrid" && options.allowCodex === false) {
-    const base = buildTitleAndSummary(messages);
+    const base = withRuleMetadata(buildTitleAndSummary(messages));
     return { ...base, providerUsed: "rule", status: "hybrid_rule_budget" };
   }
 
@@ -408,11 +691,58 @@ export function buildSessionMetadataWithOptions(
   if (!byCodex.error.startsWith("codex circuit open:")) {
     setSummaryLastError(byCodex.error);
   }
-  const fallback = buildTitleAndSummary(messages);
+  const fallback = withRuleMetadata(buildTitleAndSummary(messages));
   return {
     ...fallback,
     providerUsed: "rule",
     status: `fallback_rule:${byCodex.error || "unknown error"}`,
+  };
+}
+
+export function buildSessionMetadataForSync(
+  messages: MessageRecord[],
+  existing: CachedSummaryRecord | undefined,
+  options: { allowCodex?: boolean; endTime?: string | null } = {}
+): SyncSummaryResult {
+  const settings = getSummarySettings();
+  const contentHash = summaryContentHash(messages);
+  const cached =
+    existing &&
+    existing.summary_content_hash === contentHash &&
+    existing.summary_model === settings.model &&
+    Number(existing.summary_prompt_version ?? 0) === SUMMARY_PROMPT_VERSION &&
+    canUseStrongCache(existing, settings.provider)
+      ? cachedRecordToSummary(existing, "cache_hit")
+      : null;
+  if (cached) {
+    return {
+      ...cached,
+      contentHash,
+      model: settings.model,
+      promptVersion: SUMMARY_PROMPT_VERSION,
+      fromCache: true,
+    };
+  }
+
+  const inactiveExisting =
+    existing && !isActiveSession(options.endTime ?? existing.end_time) ? cachedRecordToSummary(existing, "cache_inactive") : null;
+  if (inactiveExisting) {
+    return {
+      ...inactiveExisting,
+      contentHash,
+      model: settings.model,
+      promptVersion: SUMMARY_PROMPT_VERSION,
+      fromCache: true,
+    };
+  }
+
+  const result = buildSessionMetadataWithOptions(messages, { allowCodex: options.allowCodex });
+  return {
+    ...result,
+    contentHash,
+    model: settings.model,
+    promptVersion: SUMMARY_PROMPT_VERSION,
+    fromCache: false,
   };
 }
 
@@ -437,6 +767,12 @@ export function testCodexSummaryConnection(): { ok: boolean; detail: string } {
     return byQwen.result
       ? { ok: true, detail: "qwen summary call succeeded" }
       : { ok: false, detail: byQwen.error || "unknown error" };
+  }
+  if (settings.provider === "friday") {
+    const byFriday = buildFridaySummary(fakeMessages, settings.model, settings.timeoutMs);
+    return byFriday.result
+      ? { ok: true, detail: "friday summary call succeeded" }
+      : { ok: false, detail: byFriday.error || "unknown error" };
   }
   const byCodex = buildCodexSummary(fakeMessages, settings.model, settings.timeoutMs, { bypassCircuit: true });
   if (byCodex.result) {

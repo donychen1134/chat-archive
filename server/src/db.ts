@@ -135,6 +135,41 @@ try {
 } catch {
   // Column may already exist.
 }
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN session_outcome TEXT NOT NULL DEFAULT ''`);
+} catch {
+  // Column may already exist.
+}
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN keywords_json TEXT NOT NULL DEFAULT '[]'`);
+} catch {
+  // Column may already exist.
+}
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN entities_json TEXT NOT NULL DEFAULT '[]'`);
+} catch {
+  // Column may already exist.
+}
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN metadata_version INTEGER NOT NULL DEFAULT 1`);
+} catch {
+  // Column may already exist.
+}
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN summary_content_hash TEXT NOT NULL DEFAULT ''`);
+} catch {
+  // Column may already exist.
+}
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN summary_model TEXT NOT NULL DEFAULT ''`);
+} catch {
+  // Column may already exist.
+}
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN summary_prompt_version INTEGER NOT NULL DEFAULT 1`);
+} catch {
+  // Column may already exist.
+}
 
 db.exec(`
 CREATE INDEX IF NOT EXISTS idx_usage_records_session_id ON usage_records(session_id);
@@ -142,6 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_records_usage_time ON usage_records(usage_t
 CREATE INDEX IF NOT EXISTS idx_usage_records_tool ON usage_records(tool);
 CREATE INDEX IF NOT EXISTS idx_session_usage_summary_tool ON session_usage_summary(tool);
 CREATE INDEX IF NOT EXISTS idx_session_usage_summary_total_tokens ON session_usage_summary(total_tokens);
+CREATE INDEX IF NOT EXISTS idx_sessions_summary_cache ON sessions(summary_content_hash, summary_model, summary_prompt_version);
 `);
 
 export function nowIso(): string {

@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { db, getDbPath } from "./db.js";
 import { syncClaudeSessions } from "./claude-ingest.js";
+import { startCodexSessionWatcher } from "./codex-watch.js";
 import { syncCodexSessions } from "./codex-ingest.js";
 import { syncCopilotSessions } from "./copilot-ingest.js";
 import { syncGeminiSessions } from "./gemini-ingest.js";
@@ -21,7 +22,20 @@ import type { UsageInput } from "./types.js";
 
 const app = Fastify({ logger: false });
 const port = Number(process.env.PORT ?? 8765);
-const AUTO_SYNC_INTERVAL_MS = 60 * 60 * 1000;
+const DEFAULT_AUTO_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+const AUTO_SYNC_INTERVAL_MS = (() => {
+  const rawMs = process.env.AUTO_SYNC_INTERVAL_MS?.trim();
+  if (rawMs) {
+    const value = Number(rawMs);
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : DEFAULT_AUTO_SYNC_INTERVAL_MS;
+  }
+  const rawSeconds = process.env.AUTO_SYNC_INTERVAL_SECONDS?.trim();
+  if (rawSeconds) {
+    const value = Number(rawSeconds);
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value * 1000) : DEFAULT_AUTO_SYNC_INTERVAL_MS;
+  }
+  return DEFAULT_AUTO_SYNC_INTERVAL_MS;
+})();
 const DB_RETRY_ATTEMPTS = Math.max(1, Number(process.env.DB_RETRY_ATTEMPTS ?? "6"));
 const DB_RETRY_DELAY_MS = Math.max(10, Number(process.env.DB_RETRY_DELAY_MS ?? "120"));
 
@@ -543,13 +557,17 @@ app.post("/api/reindex/session", async (request, reply) => {
     return { ok: false, error: `unsupported tool: ${row.tool}` };
   }
   const latest = db
-    .prepare("SELECT id, tool, source_path, title, summary, project FROM sessions WHERE source_path = ? LIMIT 1")
+    .prepare(
+      "SELECT id, tool, source_path, title, summary, project, session_purpose, session_target FROM sessions WHERE source_path = ? LIMIT 1"
+    )
     .get(row.source_path) as SessionRow | undefined;
-  if (latest) {
+  const latestPurpose = typeof latest?.session_purpose === "string" ? latest.session_purpose.trim() : "";
+  const latestTarget = typeof latest?.session_target === "string" ? latest.session_target.trim() : "";
+  if (latest && (!latestPurpose || !latestTarget || latestTarget === "会话目标")) {
     const inferred = inferSessionPurposeAndTarget(latest, getPurposeSettings());
     db.prepare("UPDATE sessions SET session_purpose = ?, session_target = ?, updated_at = ? WHERE id = ?").run(
-      inferred.session_purpose,
-      inferred.session_target,
+      latestPurpose || inferred.session_purpose,
+      latestTarget && latestTarget !== "会话目标" ? latestTarget : inferred.session_target,
       new Date().toISOString(),
       latest.id
     );
@@ -567,7 +585,7 @@ app.get("/api/summary/settings", async () => {
 
 app.post("/api/summary/settings", async (request) => {
   const body = (request.body ?? {}) as {
-    provider?: "codex" | "qwen" | "rule" | "hybrid";
+    provider?: "codex" | "qwen" | "friday" | "rule" | "hybrid";
     model?: string;
     timeoutMs?: number;
     codexLimitPerRun?: number;
@@ -704,6 +722,10 @@ app.get("/api/sessions", async (request, reply) => {
           s.summary_status,
           s.session_purpose,
           s.session_target,
+          s.session_outcome,
+          s.keywords_json,
+          s.entities_json,
+          s.metadata_version,
           s.message_count,
           u.usage_status,
           u.provider AS usage_provider,
@@ -746,6 +768,10 @@ app.get("/api/sessions", async (request, reply) => {
           s.summary_status,
           s.session_purpose,
           s.session_target,
+          s.session_outcome,
+          s.keywords_json,
+          s.entities_json,
+          s.metadata_version,
           s.message_count,
           u.usage_status,
           u.provider AS usage_provider,
@@ -769,7 +795,17 @@ app.get("/api/sessions", async (request, reply) => {
           s.updated_at,
           'meta' AS hit_role,
           substr(
-            COALESCE(NULLIF(s.title,''), NULLIF(s.summary,''), NULLIF(s.project,''), s.source_path),
+            COALESCE(
+              NULLIF(s.title,''),
+              NULLIF(s.summary,''),
+              NULLIF(s.session_purpose,''),
+              NULLIF(s.session_target,''),
+              NULLIF(s.session_outcome,''),
+              NULLIF(s.keywords_json,'[]'),
+              NULLIF(s.entities_json,'[]'),
+              NULLIF(s.project,''),
+              s.source_path
+            ),
             1, 120
           ) AS hit_excerpt
         FROM sessions s
@@ -777,6 +813,11 @@ app.get("/api/sessions", async (request, reply) => {
         WHERE (
           s.title LIKE ? ESCAPE '\\' OR
           s.summary LIKE ? ESCAPE '\\' OR
+          COALESCE(s.session_purpose,'') LIKE ? ESCAPE '\\' OR
+          COALESCE(s.session_target,'') LIKE ? ESCAPE '\\' OR
+          COALESCE(s.session_outcome,'') LIKE ? ESCAPE '\\' OR
+          COALESCE(s.keywords_json,'') LIKE ? ESCAPE '\\' OR
+          COALESCE(s.entities_json,'') LIKE ? ESCAPE '\\' OR
           COALESCE(s.project,'') LIKE ? ESCAPE '\\' OR
           s.source_path LIKE ? ESCAPE '\\'
         ) ${toolClause}
@@ -795,6 +836,10 @@ app.get("/api/sessions", async (request, reply) => {
         summary_status,
         session_purpose,
         session_target,
+        session_outcome,
+        keywords_json,
+        entities_json,
+        metadata_version,
         message_count,
         usage_status,
         usage_provider,
@@ -833,6 +878,10 @@ app.get("/api/sessions", async (request, reply) => {
         summary_status,
         session_purpose,
         session_target,
+        session_outcome,
+        keywords_json,
+        entities_json,
+        metadata_version,
         message_count,
         usage_status,
         usage_provider,
@@ -854,7 +903,22 @@ app.get("/api/sessions", async (request, reply) => {
       LIMIT ? OFFSET ?
     `
           )
-          .all(ftsQuery, ...toolFilters, likeQuery, likeQuery, likeQuery, likeQuery, ...toolFilters, pageSize, offset)
+          .all(
+            ftsQuery,
+            ...toolFilters,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            ...toolFilters,
+            pageSize,
+            offset
+          )
       )) as SessionRow[];
 
       total = (await withDbRetry(() =>
@@ -872,6 +936,11 @@ app.get("/api/sessions", async (request, reply) => {
         WHERE (
           s.title LIKE ? ESCAPE '\\' OR
           s.summary LIKE ? ESCAPE '\\' OR
+          COALESCE(s.session_purpose,'') LIKE ? ESCAPE '\\' OR
+          COALESCE(s.session_target,'') LIKE ? ESCAPE '\\' OR
+          COALESCE(s.session_outcome,'') LIKE ? ESCAPE '\\' OR
+          COALESCE(s.keywords_json,'') LIKE ? ESCAPE '\\' OR
+          COALESCE(s.entities_json,'') LIKE ? ESCAPE '\\' OR
           COALESCE(s.project,'') LIKE ? ESCAPE '\\' OR
           s.source_path LIKE ? ESCAPE '\\'
         ) ${toolClause}
@@ -879,7 +948,20 @@ app.get("/api/sessions", async (request, reply) => {
       SELECT COUNT(*) as c FROM matched_ids
     `
           )
-          .get(ftsQuery, ...toolFilters, likeQuery, likeQuery, likeQuery, likeQuery, ...toolFilters)
+          .get(
+            ftsQuery,
+            ...toolFilters,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            likeQuery,
+            ...toolFilters
+          )
       )) as { c: number };
     } else {
       const queryParams = [ftsQuery, ...toolFilters, pageSize, offset];
@@ -903,6 +985,10 @@ app.get("/api/sessions", async (request, reply) => {
           s.summary_status,
           s.session_purpose,
           s.session_target,
+          s.session_outcome,
+          s.keywords_json,
+          s.entities_json,
+          s.metadata_version,
           s.message_count,
           u.usage_status,
           u.provider AS usage_provider,
@@ -945,6 +1031,10 @@ app.get("/api/sessions", async (request, reply) => {
         summary_status,
         session_purpose,
         session_target,
+        session_outcome,
+        keywords_json,
+        entities_json,
+        metadata_version,
         message_count,
         usage_status,
         usage_provider,
@@ -983,6 +1073,10 @@ app.get("/api/sessions", async (request, reply) => {
         summary_status,
         session_purpose,
         session_target,
+        session_outcome,
+        keywords_json,
+        entities_json,
+        metadata_version,
         message_count,
         usage_status,
         usage_provider,
@@ -1276,6 +1370,8 @@ app.get("/api/session", async (request, reply) => {
 app.listen({ port, host: "127.0.0.1" }).then(() => {
   console.log(`chat-archive server running at http://127.0.0.1:${port}`);
   if (process.env.AUTO_SYNC_ON_START !== "false") {
+    startCodexSessionWatcher();
+
     setTimeout(() => {
       try {
         startSyncTask("sync");
@@ -1284,12 +1380,17 @@ app.listen({ port, host: "127.0.0.1" }).then(() => {
       }
     }, 0);
 
-    setInterval(() => {
-      try {
-        startSyncTask("sync");
-      } catch (error) {
-        console.error("scheduled sync failed:", error);
-      }
-    }, AUTO_SYNC_INTERVAL_MS);
+    if (AUTO_SYNC_INTERVAL_MS > 0) {
+      console.log(`chat-archive auto sync interval: ${AUTO_SYNC_INTERVAL_MS}ms`);
+      setInterval(() => {
+        try {
+          startSyncTask("sync");
+        } catch (error) {
+          console.error("scheduled sync failed:", error);
+        }
+      }, AUTO_SYNC_INTERVAL_MS);
+    } else {
+      console.log("chat-archive scheduled auto sync disabled");
+    }
   }
 });

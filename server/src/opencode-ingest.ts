@@ -4,7 +4,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import Database from "better-sqlite3";
 import { db, nowIso } from "./db.js";
-import { buildSessionMetadataWithOptions } from "./summary-provider.js";
+import { buildSessionMetadataForSync, type CachedSummaryRecord } from "./summary-provider.js";
 import { getSummarySettings } from "./settings.js";
 import type { ChatRole, MessageRecord, SyncProgress, SyncStats, UsageInput } from "./types.js";
 import { replaceSessionUsage } from "./usage.js";
@@ -344,6 +344,12 @@ export function syncOpencodeSessions(
     }
 
     const getState = db.prepare("SELECT last_mtime_ms, last_size FROM ingest_state WHERE source_path = ?");
+    const getExistingSession = db.prepare(`
+      SELECT title, summary, summary_provider, summary_status, session_purpose, session_target,
+        session_outcome, keywords_json, entities_json, summary_content_hash, summary_model,
+        summary_prompt_version, end_time
+      FROM sessions WHERE id = ?
+    `);
     const upsertState = db.prepare(`
       INSERT INTO ingest_state(source_path, last_mtime_ms, last_size, updated_at)
       VALUES (?, ?, ?, ?)
@@ -358,8 +364,11 @@ export function syncOpencodeSessions(
     const insertSession = db.prepare(`
       INSERT INTO sessions(
         id, tool, source_path, project, start_time, end_time, duration_sec,
-        title, summary, summary_provider, summary_status, message_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        title, summary, summary_provider, summary_status, session_purpose, session_target,
+        session_outcome, keywords_json, entities_json, metadata_version,
+        summary_content_hash, summary_model, summary_prompt_version,
+        message_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertMessage = db.prepare(`
       INSERT INTO messages(id, session_id, role, ts, content, turn_index, seq_in_session)
@@ -392,12 +401,13 @@ export function syncOpencodeSessions(
       const end = parsed.messages[parsed.messages.length - 1]?.ts ?? parseEpochMillis(session.time_updated);
       const durationSec = Math.max(0, Math.floor((new Date(end).valueOf() - new Date(start).valueOf()) / 1000));
       const allowCodex = settings.provider !== "hybrid" || codexBudget > 0;
-      const { title, summary, providerUsed, status } = buildSessionMetadataWithOptions(parsed.messages, { allowCodex });
-      if (providerUsed === "codex" && settings.provider === "hybrid" && codexBudget > 0) {
+      const sessionPk = `opencode:${session.id}`;
+      const existing = getExistingSession.get(sessionPk) as CachedSummaryRecord | undefined;
+      const metadata = buildSessionMetadataForSync(parsed.messages, existing, { allowCodex, endTime: end });
+      if (!metadata.fromCache && metadata.providerUsed === "codex" && settings.provider === "hybrid" && codexBudget > 0) {
         codexBudget -= 1;
       }
       const now = nowIso();
-      const sessionPk = `opencode:${session.id}`;
 
       deleteFts.run(sessionPk);
       deleteMessages.run(sessionPk);
@@ -411,10 +421,19 @@ export function syncOpencodeSessions(
         start,
         end,
         durationSec,
-        parsed.title || title || session.title || "Untitled Session",
-        summary,
-        providerUsed,
-        status,
+        parsed.title || metadata.title || session.title || "Untitled Session",
+        metadata.summary,
+        metadata.providerUsed,
+        metadata.status,
+        metadata.purpose,
+        metadata.target,
+        metadata.outcome,
+        JSON.stringify(metadata.keywords),
+        JSON.stringify(metadata.entities),
+        2,
+        metadata.contentHash,
+        metadata.model,
+        metadata.promptVersion,
         parsed.messages.length,
         now,
         now

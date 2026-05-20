@@ -28,6 +28,10 @@ interface Session {
   resume_label?: string;
   session_purpose?: string;
   session_target?: string;
+  session_outcome?: string;
+  keywords_json?: string;
+  entities_json?: string;
+  metadata_version?: number;
   hit_score?: number;
   hit_roles?: string;
   hit_excerpt?: string;
@@ -157,6 +161,17 @@ function parseSummary(summary: string): { headline: string; keywords: string } {
   }
 
   return { headline: s, keywords: "" };
+}
+
+function parseStringListJson(raw: string | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+  } catch {
+    return [];
+  }
 }
 
 function formatTime(value: string): string {
@@ -396,7 +411,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [serverOk, setServerOk] = useState<boolean | null>(null);
   const [showSystemAndTool, setShowSystemAndTool] = useState(false);
-  const [summaryProvider, setSummaryProvider] = useState<"codex" | "qwen" | "rule" | "hybrid">("rule");
+  const [summaryProvider, setSummaryProvider] = useState<"codex" | "qwen" | "friday" | "rule" | "hybrid">("rule");
   const [summaryModel, setSummaryModel] = useState("gpt-5-codex");
   const [summaryTimeoutMs, setSummaryTimeoutMs] = useState(20000);
   const [codexLimitPerRun, setCodexLimitPerRun] = useState(8);
@@ -434,7 +449,7 @@ export function App() {
       if (!resp.ok) return;
       const data = (await resp.json()) as {
         settings: {
-          provider: "codex" | "qwen" | "rule" | "hybrid";
+          provider: "codex" | "qwen" | "friday" | "rule" | "hybrid";
           model: string;
           timeoutMs: number;
           codexLimitPerRun: number;
@@ -974,6 +989,11 @@ export function App() {
     () => parseSummary(selectedSession?.summary ?? ""),
     [selectedSession?.summary]
   );
+  const selectedSessionKeywords = useMemo(() => {
+    const structured = parseStringListJson(selectedSession?.keywords_json);
+    if (structured.length > 0) return structured.join("、");
+    return selectedSessionParsedSummary.keywords;
+  }, [selectedSession?.keywords_json, selectedSessionParsedSummary.keywords]);
   const sessionUsageTimeline = useMemo(() => {
     return (sessionUsage?.timeline ?? []).map((item) => ({
       day: item.day,
@@ -1339,10 +1359,16 @@ export function App() {
                       <span className="meta-key">会话总结</span>
                       <code className="meta-value">{selectedSessionParsedSummary.headline || selectedSession.summary}</code>
                     </div>
-                    {selectedSessionParsedSummary.keywords && (
+                    {(selectedSession.session_outcome ?? "").trim().length > 0 && (
+                      <div className="session-meta-item">
+                        <span className="meta-key">结果</span>
+                        <code className="meta-value">{selectedSession.session_outcome}</code>
+                      </div>
+                    )}
+                    {selectedSessionKeywords && (
                       <div className="session-meta-item">
                         <span className="meta-key">关键词</span>
-                        <code className="meta-value">{selectedSessionParsedSummary.keywords}</code>
+                        <code className="meta-value">{selectedSessionKeywords}</code>
                       </div>
                     )}
                     <div className="session-meta-item">
@@ -1525,7 +1551,8 @@ export function App() {
                 <div className="summary-panel summary-panel-plain">
                   <div className="summary-row">
                     <span>Provider</span>
-                    <select value={summaryProvider} onChange={(e) => setSummaryProvider(e.target.value as "codex" | "qwen" | "rule" | "hybrid")}>
+                    <select value={summaryProvider} onChange={(e) => setSummaryProvider(e.target.value as "codex" | "qwen" | "friday" | "rule" | "hybrid")}>
+                      <option value="friday">friday</option>
                       <option value="qwen">qwen</option>
                       <option value="hybrid">hybrid (推荐)</option>
                       <option value="codex">codex (全量)</option>

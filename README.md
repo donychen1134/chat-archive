@@ -36,6 +36,7 @@ All data is stored locally in SQLite.
 - Topic extraction providers:
   - `rule` (default, no external dependency)
   - `qwen`
+  - `friday`
   - `codex`
   - `hybrid`
 
@@ -104,15 +105,22 @@ curl -X POST http://127.0.0.1:8765/api/summary/test
 - `CHAT_ARCHIVE_HOME` (default: `~/.chat-archive`)
 - `PORT` (default: `8765`)
 - `AUTO_SYNC_ON_START=false`
+- `AUTO_SYNC_INTERVAL_MS` (default: `300000`; set `0` to disable scheduled sync)
+- `AUTO_SYNC_INTERVAL_SECONDS` (used only when `AUTO_SYNC_INTERVAL_MS` is not set)
+- `CODEX_WATCH_ENABLED=false` (disable Codex session file watcher)
+- `CODEX_WATCH_DEBOUNCE_MS` (default: `3000`)
+- `CODEX_WATCH_RETRY_MS` (default: `5000`)
 
 Summary-related:
 
-- `CHAT_ARCHIVE_SUMMARY_PROVIDER` = `rule|qwen|hybrid|codex` (default: `rule`)
+- `CHAT_ARCHIVE_SUMMARY_PROVIDER` = `rule|qwen|friday|hybrid|codex` (default: `rule`)
 - `CHAT_ARCHIVE_SUMMARY_MODEL` (default: `gpt-5-codex`)
 - `CHAT_ARCHIVE_SUMMARY_TIMEOUT_MS` (default: `30000`)
 - `CHAT_ARCHIVE_CODEX_LIMIT_PER_RUN` (default: `8`)
 - `CHAT_ARCHIVE_QWEN_API_KEY` (or `DASHSCOPE_API_KEY`)
 - `CHAT_ARCHIVE_QWEN_BASE_URL` (default: `https://dashscope.aliyuncs.com/compatible-mode/v1`)
+- `CHAT_ARCHIVE_FRIDAY_APP_ID` (or local app_config `friday.app_id`)
+- `CHAT_ARCHIVE_FRIDAY_BASE_URL` (default: `https://aigc.sankuai.com/v1/openai/native`)
 
 ## Security Notes
 
