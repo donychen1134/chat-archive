@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { db, nowIso } from "./db.js";
-import { buildSessionMetadataForSync, type CachedSummaryRecord } from "./summary-provider.js";
+import { buildSessionMetadataForSync, shouldRefreshUnchangedSummary, type CachedSummaryRecord } from "./summary-provider.js";
 import { getSummarySettings } from "./settings.js";
 import type { ChatRole, MessageRecord, SyncProgress, SyncStats, UsageInput } from "./types.js";
 import { replaceSessionUsage } from "./usage.js";
@@ -316,7 +316,7 @@ export function syncCopilotSessions(
     const durationSec = Math.max(0, Math.floor((new Date(end).valueOf() - new Date(start).valueOf()) / 1000));
     const allowCodex = settings.provider !== "hybrid" || codexBudget > 0;
     const existing = getExistingSession.get(sessionId) as CachedSummaryRecord | undefined;
-    const metadata = buildSessionMetadataForSync(messages, existing, { allowCodex, endTime: end });
+    const metadata = buildSessionMetadataForSync(messages, existing, { allowCodex, startTime: start, endTime: end });
     if (!metadata.fromCache && metadata.providerUsed === "codex" && settings.provider === "hybrid" && codexBudget > 0) {
       codexBudget -= 1;
     }
@@ -377,6 +377,21 @@ export function syncCopilotSessions(
     currentFile = filePath;
     const state = getState.get(filePath) as { last_mtime_ms: number; last_size: number } | undefined;
     if (state && state.last_mtime_ms === Math.floor(stat.mtimeMs) && state.last_size === stat.size) {
+      const parsed = parseCopilotFile(filePath, stat);
+      const sessionId = fileToSessionId(root, filePath, parsed.sessionIdHint);
+      const existing = getExistingSession.get(sessionId) as CachedSummaryRecord | undefined;
+      if (shouldRefreshUnchangedSummary(existing)) {
+        try {
+          tx(filePath, stat);
+        } catch (error) {
+          stats.warnings += 1;
+          const detail = error instanceof Error ? error.message : String(error);
+          stats.warningDetails.push(`[copilot] metadata refresh failed: ${filePath} (${detail})`);
+        }
+        processedFiles += 1;
+        emitProgress();
+        continue;
+      }
       stats.skippedFiles += 1;
       processedFiles += 1;
       emitProgress();

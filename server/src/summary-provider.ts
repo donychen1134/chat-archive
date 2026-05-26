@@ -42,7 +42,7 @@ export type SyncSummaryResult = SummaryResult & {
   fromCache: boolean;
 };
 
-export const SUMMARY_PROMPT_VERSION = 3;
+export const SUMMARY_PROMPT_VERSION = 5;
 
 let codexCircuitUntilMs = 0;
 let codexCircuitReason = "";
@@ -274,16 +274,26 @@ function canUseStrongCache(existing: CachedSummaryRecord, provider: SummaryProvi
   return true;
 }
 
-function activeWindowMs(): number {
-  const hours = Number(process.env.CHAT_ARCHIVE_SUMMARY_ACTIVE_HOURS ?? "24");
-  if (!Number.isFinite(hours) || hours < 0) return 24 * 60 * 60 * 1000;
-  return hours * 60 * 60 * 1000;
+function nonRuleProvider(provider: SummaryProvider): boolean {
+  return provider !== "rule";
 }
 
-function isActiveSession(endTime: string | null | undefined): boolean {
-  const windowMs = activeWindowMs();
+function successfulNonRuleSummary(existing: CachedSummaryRecord): boolean {
+  const status = (existing.summary_status ?? "").toLowerCase();
+  const provider = providerFromCache(existing.summary_provider);
+  return provider !== "rule" && !status.startsWith("fallback_rule");
+}
+
+function remoteSummaryMaxAgeMs(): number {
+  const days = Number(process.env.CHAT_ARCHIVE_REMOTE_SUMMARY_MAX_AGE_DAYS ?? "5");
+  if (!Number.isFinite(days) || days < 0) return 5 * 24 * 60 * 60 * 1000;
+  return days * 24 * 60 * 60 * 1000;
+}
+
+function isWithinRemoteSummaryAge(startTime: string | null | undefined): boolean {
+  const windowMs = remoteSummaryMaxAgeMs();
   if (windowMs === 0) return false;
-  const ts = endTime ? new Date(endTime).valueOf() : Date.now();
+  const ts = startTime ? new Date(startTime).valueOf() : Date.now();
   if (!Number.isFinite(ts)) return true;
   return Date.now() - ts <= windowMs;
 }
@@ -362,6 +372,94 @@ function normalizeQwenModel(input: string): string {
   return m;
 }
 
+function logSummary(provider: string, model: string, ok: boolean, promptChars: number, usage: Record<string, number> | null, error?: string): void {
+  const ts = new Date().toISOString();
+  if (ok && usage) {
+    console.log(`[summary] ${ts} provider=${provider} model=${model} ok prompt_chars=${promptChars} input_tokens=${usage.prompt_tokens ?? usage.input_tokens ?? "?"} output_tokens=${usage.completion_tokens ?? usage.output_tokens ?? "?"}`);
+  } else if (ok) {
+    console.log(`[summary] ${ts} provider=${provider} model=${model} ok prompt_chars=${promptChars}`);
+  } else {
+    console.log(`[summary] ${ts} provider=${provider} model=${model} fail prompt_chars=${promptChars} error=${String(error ?? "unknown")}`);
+  }
+}
+
+function parseHttpStatus(headers: string): number | null {
+  const lines = headers.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const m = lines[i]?.match(/^HTTP\/\S+\s+(\d{3})\b/i);
+    if (m?.[1]) return Number(m[1]);
+  }
+  return null;
+}
+
+function headerValue(headers: string, name: string): string {
+  const lower = name.toLowerCase();
+  const lines = headers.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i] ?? "";
+    const idx = line.indexOf(":");
+    if (idx <= 0) continue;
+    if (line.slice(0, idx).trim().toLowerCase() === lower) {
+      return line.slice(idx + 1).trim();
+    }
+  }
+  return "";
+}
+
+function cleanDetail(value: unknown, max = 500): string {
+  if (typeof value !== "string") return "";
+  return value.replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function payloadErrorDetail(payload: Record<string, unknown>): string {
+  const candidates: unknown[] = [
+    (payload.error as Record<string, unknown> | undefined)?.message,
+    (payload.error as Record<string, unknown> | undefined)?.type,
+    payload.message,
+    payload.msg,
+    payload.detail,
+    payload.code,
+    payload.resCode,
+    payload.status_code,
+  ];
+  return candidates
+    .map((v) => (typeof v === "number" ? String(v) : cleanDetail(v, 240)))
+    .filter(Boolean)
+    .join(" | ");
+}
+
+function tryParseJsonObject(raw: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(raw || "{}") as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function fridayTraceSuffix(headers: string): string {
+  const traceId = headerValue(headers, "m-traceid") || headerValue(headers, "m-trace-id") || headerValue(headers, "traceid");
+  return traceId ? ` trace_id=${traceId}` : "";
+}
+
+function invalidModelJsonDetail(payload: Record<string, unknown>, contentText: string): string {
+  const choice = (payload.choices as Array<Record<string, unknown>> | undefined)?.[0];
+  const finishReason = cleanDetail(choice?.finish_reason, 120);
+  const message = choice?.message as Record<string, unknown> | undefined;
+  const refusal = cleanDetail(message?.refusal, 240);
+  const payloadDetail = payloadErrorDetail(payload);
+  const contentSnippet = cleanDetail(contentText, 500);
+  return [
+    "output is not valid JSON object",
+    finishReason ? `finish_reason=${finishReason}` : "",
+    refusal ? `refusal=${refusal}` : "",
+    payloadDetail ? `payload=${payloadDetail}` : "",
+    contentSnippet ? `content=${contentSnippet}` : "content=<empty>",
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
+
 function buildQwenSummary(
   messages: MessageRecord[],
   model: string,
@@ -375,9 +473,11 @@ function buildQwenSummary(
   }
 
   const prompt = metadataPrompt(content);
+  const promptChars = prompt.length;
+  const normalizedModel = normalizeQwenModel(model);
 
   const reqBody = JSON.stringify({
-    model: normalizeQwenModel(model),
+    model: normalizedModel,
     temperature: 0.2,
     messages: [
       { role: "system", content: "你只输出严格 JSON，且内容使用简体中文。" },
@@ -410,17 +510,22 @@ function buildQwenSummary(
   );
 
   if (result.status !== 0) {
-    return { result: null, error: tail(result.stderr || result.stdout || `qwen curl exit ${String(result.status)}`) };
+    const err = tail(result.stderr || result.stdout || `qwen curl exit ${String(result.status)}`);
+    logSummary("qwen", normalizedModel, false, promptChars, null, err);
+    return { result: null, error: err };
   }
 
   let payload: Record<string, unknown>;
   try {
     payload = JSON.parse(result.stdout || "{}") as Record<string, unknown>;
   } catch {
+    logSummary("qwen", normalizedModel, false, promptChars, null, "non-json response");
     return { result: null, error: "qwen returned non-json response" };
   }
   if (payload.error && typeof (payload.error as Record<string, unknown>).message === "string") {
-    return { result: null, error: `qwen api error: ${String((payload.error as Record<string, unknown>).message)}` };
+    const err = `qwen api error: ${String((payload.error as Record<string, unknown>).message)}`;
+    logSummary("qwen", normalizedModel, false, promptChars, null, err);
+    return { result: null, error: err };
   }
 
   const contentText =
@@ -428,7 +533,12 @@ function buildQwenSummary(
       | string
       | undefined) ?? "";
   const parsed = parseMetadataObject(contentText);
-  if (!parsed) return { result: null, error: "qwen output is not valid JSON object" };
+  if (!parsed) {
+    logSummary("qwen", normalizedModel, false, promptChars, null, "output is not valid JSON object");
+    return { result: null, error: "qwen output is not valid JSON object" };
+  }
+  const usage = payload.usage as Record<string, number> | null ?? null;
+  logSummary("qwen", normalizedModel, true, promptChars, usage);
   return {
     result: {
       ...parsed,
@@ -452,8 +562,11 @@ function buildFridaySummary(
   }
 
   const prompt = metadataPrompt(content);
+  const promptChars = prompt.length;
+  const normalizedModel = model.trim() || "gpt-4.1-nano";
+
   const reqBody = JSON.stringify({
-    model: model.trim() || "gpt-4.1-nano",
+    model: normalizedModel,
     temperature: 0.2,
     stream: false,
     messages: [
@@ -462,10 +575,14 @@ function buildFridaySummary(
     ],
   });
 
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "chat-archive-friday-"));
+  const headerFile = path.join(tmp, "headers.txt");
   const result = spawnSync(
     "curl",
     [
       "-sS",
+      "-D",
+      headerFile,
       "--max-time",
       String(Math.max(3, Math.ceil(timeoutMs / 1000))),
       "-X",
@@ -485,19 +602,42 @@ function buildFridaySummary(
       env: { ...process.env },
     }
   );
+  const responseHeaders = fs.existsSync(headerFile) ? fs.readFileSync(headerFile, "utf8") : "";
+  try {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  } catch {
+    // Best effort cleanup only.
+  }
+  const responseBody = result.stdout || "";
+  const httpStatus = parseHttpStatus(responseHeaders);
+  const traceSuffix = fridayTraceSuffix(responseHeaders);
 
   if (result.status !== 0) {
-    return { result: null, error: tail(result.stderr || result.stdout || `friday curl exit ${String(result.status)}`) };
+    const err = tail(result.stderr || responseBody || `friday curl exit ${String(result.status)}`);
+    logSummary("friday", normalizedModel, false, promptChars, null, err);
+    return { result: null, error: err };
   }
 
   let payload: Record<string, unknown>;
-  try {
-    payload = JSON.parse(result.stdout || "{}") as Record<string, unknown>;
-  } catch {
-    return { result: null, error: `friday returned non-json response: ${tail(result.stdout || result.stderr || "", 240)}` };
+  const parsedPayload = tryParseJsonObject(responseBody);
+  if (!parsedPayload) {
+    const statusPrefix = httpStatus ? `http ${httpStatus}: ` : "";
+    const err = `friday returned non-json response: ${statusPrefix}${tail(responseBody || result.stderr || "", 500)}${traceSuffix}`;
+    logSummary("friday", normalizedModel, false, promptChars, null, err);
+    return { result: null, error: err };
+  }
+  payload = parsedPayload;
+  if (httpStatus && (httpStatus < 200 || httpStatus >= 300)) {
+    const detail = payloadErrorDetail(payload) || tail(responseBody, 500) || "empty response body";
+    const err = `friday http ${httpStatus}: ${detail}${traceSuffix}`;
+    logSummary("friday", normalizedModel, false, promptChars, null, err);
+    return { result: null, error: err };
   }
   if (payload.error && typeof (payload.error as Record<string, unknown>).message === "string") {
-    return { result: null, error: `friday api error: ${String((payload.error as Record<string, unknown>).message)}` };
+    const detail = payloadErrorDetail(payload) || String((payload.error as Record<string, unknown>).message);
+    const err = `friday api error: ${detail}${traceSuffix}`;
+    logSummary("friday", normalizedModel, false, promptChars, null, err);
+    return { result: null, error: err };
   }
 
   const contentText =
@@ -505,7 +645,13 @@ function buildFridaySummary(
       | string
       | undefined) ?? "";
   const parsed = parseMetadataObject(contentText);
-  if (!parsed) return { result: null, error: "friday output is not valid JSON object" };
+  if (!parsed) {
+    const err = `friday ${invalidModelJsonDetail(payload, contentText)}${traceSuffix}`;
+    logSummary("friday", normalizedModel, false, promptChars, null, err);
+    return { result: null, error: err };
+  }
+  const usage = payload.usage as Record<string, number> | null ?? null;
+  logSummary("friday", normalizedModel, true, promptChars, usage);
   return {
     result: {
       ...parsed,
@@ -562,6 +708,8 @@ function buildCodexSummary(
       }
     );
 
+  const promptChars = prompt.length;
+
   let result = runCodex(true);
 
   // Retry once for transient websocket/http transport errors.
@@ -585,6 +733,7 @@ function buildCodexSummary(
       codexCircuitUntilMs = Date.now() + 60 * 1000;
       codexCircuitReason = err;
     }
+    logSummary("codex", model, false, promptChars, null, err);
     return { result: null, error: err };
   }
   let raw = "";
@@ -608,6 +757,7 @@ function buildCodexSummary(
       codexCircuitUntilMs = Date.now() + 60 * 1000;
       codexCircuitReason = err;
     }
+    logSummary("codex", model, false, promptChars, null, err);
     return {
       result: null,
       error: err,
@@ -615,9 +765,13 @@ function buildCodexSummary(
   }
 
   const parsed = parseMetadataObject(raw) ?? parseMetadataObject(result.stdout ?? "");
-  if (!parsed) return { result: null, error: "output is not valid JSON object" };
+  if (!parsed) {
+    logSummary("codex", model, false, promptChars, null, "output is not valid JSON object");
+    return { result: null, error: "output is not valid JSON object" };
+  }
 
   codexConsecutiveFailures = 0;
+  logSummary("codex", model, true, promptChars, null);
   return {
     result: {
       ...parsed,
@@ -702,10 +856,29 @@ export function buildSessionMetadataWithOptions(
 export function buildSessionMetadataForSync(
   messages: MessageRecord[],
   existing: CachedSummaryRecord | undefined,
-  options: { allowCodex?: boolean; endTime?: string | null } = {}
+  options: { allowCodex?: boolean; startTime?: string | null; endTime?: string | null } = {}
 ): SyncSummaryResult {
   const settings = getSummarySettings();
   const contentHash = summaryContentHash(messages);
+  const existingModel = existing?.summary_model || settings.model;
+  const existingPromptVersion = Number(existing?.summary_prompt_version ?? 0) || SUMMARY_PROMPT_VERSION;
+
+  const stableNonRuleCached =
+    existing &&
+    existing.summary_content_hash === contentHash &&
+    successfulNonRuleSummary(existing)
+      ? cachedRecordToSummary(existing, "cache_non_rule")
+      : null;
+  if (stableNonRuleCached) {
+    return {
+      ...stableNonRuleCached,
+      contentHash,
+      model: existingModel,
+      promptVersion: existingPromptVersion,
+      fromCache: true,
+    };
+  }
+
   const cached =
     existing &&
     existing.summary_content_hash === contentHash &&
@@ -718,21 +891,37 @@ export function buildSessionMetadataForSync(
     return {
       ...cached,
       contentHash,
-      model: settings.model,
-      promptVersion: SUMMARY_PROMPT_VERSION,
+      model: existingModel,
+      promptVersion: existingPromptVersion,
       fromCache: true,
     };
   }
 
-  const inactiveExisting =
-    existing && !isActiveSession(options.endTime ?? existing.end_time) ? cachedRecordToSummary(existing, "cache_inactive") : null;
-  if (inactiveExisting) {
+  const remoteExpired =
+    nonRuleProvider(settings.provider) && !isWithinRemoteSummaryAge(options.startTime ?? messages[0]?.ts ?? null);
+  const expiredExisting =
+    existing && remoteExpired && existing.summary_content_hash === contentHash
+      ? cachedRecordToSummary(existing, "cache_remote_expired")
+      : null;
+  if (expiredExisting) {
     return {
-      ...inactiveExisting,
+      ...expiredExisting,
       contentHash,
-      model: settings.model,
-      promptVersion: SUMMARY_PROMPT_VERSION,
+      model: existingModel,
+      promptVersion: existingPromptVersion,
       fromCache: true,
+    };
+  }
+  if (remoteExpired) {
+    const base = withRuleMetadata(buildTitleAndSummary(messages));
+    return {
+      ...base,
+      providerUsed: "rule",
+      status: "remote_summary_expired",
+      contentHash,
+      model: "",
+      promptVersion: SUMMARY_PROMPT_VERSION,
+      fromCache: false,
     };
   }
 
@@ -744,6 +933,14 @@ export function buildSessionMetadataForSync(
     promptVersion: SUMMARY_PROMPT_VERSION,
     fromCache: false,
   };
+}
+
+export function shouldRefreshUnchangedSummary(existing: CachedSummaryRecord | undefined): boolean {
+  if (!existing) return false;
+  const status = (existing.summary_status ?? "").toLowerCase();
+  const version = Number(existing.summary_prompt_version ?? 0);
+  if (version >= SUMMARY_PROMPT_VERSION) return false;
+  return providerFromCache(existing.summary_provider) === "rule" && status.startsWith("fallback_rule");
 }
 
 export function testCodexSummaryConnection(): { ok: boolean; detail: string } {

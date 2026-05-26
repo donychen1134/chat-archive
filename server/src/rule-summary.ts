@@ -136,6 +136,10 @@ function stripRequestShell(value: string): string {
   if (/学城文档/.test(title) && /写入|创建|发布/.test(value)) return trimTitle(title.replace(/将|把|文档/g, ""), 50);
   if (/学城文档/.test(title)) return "学城文档阅读";
   if (/ONES 工作项/.test(title)) return "ONES 工作项分析";
+  if (/^review\s+the\s+code\s+changes/i.test(title) || /provide\s+prioritized,\s*actionable\s+findings/i.test(title)) {
+    const base = title.match(/base branch ['"]?([A-Za-z0-9._/-]+)['"]?/i)?.[1];
+    return base ? `${base} 分支代码变更审查` : "代码变更审查";
+  }
   if (/写入.*学城|发布.*学城/.test(title)) {
     const file = title.match(/[A-Za-z0-9_.-]+\.(?:md|markdown|txt|docx?)/i)?.[0];
     return file ? trimTitle(`${file} 写入学城`) : "文档写入学城";

@@ -4,7 +4,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import Database from "better-sqlite3";
 import { db, nowIso } from "./db.js";
-import { buildSessionMetadataForSync, type CachedSummaryRecord } from "./summary-provider.js";
+import { buildSessionMetadataForSync, shouldRefreshUnchangedSummary, type CachedSummaryRecord } from "./summary-provider.js";
 import { getSummarySettings } from "./settings.js";
 import type { ChatRole, MessageRecord, SyncProgress, SyncStats, UsageInput } from "./types.js";
 import { replaceSessionUsage } from "./usage.js";
@@ -403,7 +403,7 @@ export function syncOpencodeSessions(
       const allowCodex = settings.provider !== "hybrid" || codexBudget > 0;
       const sessionPk = `opencode:${session.id}`;
       const existing = getExistingSession.get(sessionPk) as CachedSummaryRecord | undefined;
-      const metadata = buildSessionMetadataForSync(parsed.messages, existing, { allowCodex, endTime: end });
+      const metadata = buildSessionMetadataForSync(parsed.messages, existing, { allowCodex, startTime: start, endTime: end });
       if (!metadata.fromCache && metadata.providerUsed === "codex" && settings.provider === "hybrid" && codexBudget > 0) {
         codexBudget -= 1;
       }
@@ -470,6 +470,13 @@ export function syncOpencodeSessions(
         const state = getState.get(currentFile) as { last_mtime_ms: number; last_size: number } | undefined;
         const sizeMarker = opencodeStateMarker(session, parsed.title, partRows.length);
         if (state && state.last_mtime_ms === session.time_updated && state.last_size === sizeMarker) {
+          const existing = getExistingSession.get(`opencode:${session.id}`) as CachedSummaryRecord | undefined;
+          if (shouldRefreshUnchangedSummary(existing)) {
+            tx(session);
+            processedFiles += 1;
+            emitProgress();
+            continue;
+          }
           stats.skippedFiles += 1;
           processedFiles += 1;
           emitProgress();
