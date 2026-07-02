@@ -7,6 +7,7 @@ type Scope = "all" | "question" | "answer";
 type Role = "user" | "assistant" | "tool" | "system";
 type ToolFilter = "codex" | "claude" | "copilot" | "gemini" | "opencode";
 type ViewMode = "archive" | "usage";
+type SessionSortBy = "start_time" | "end_time";
 const ALL_TOOLS: ToolFilter[] = ["codex", "claude", "copilot", "gemini", "opencode"];
 
 interface Session {
@@ -400,6 +401,7 @@ export function App() {
   const [totalSessions, setTotalSessions] = useState(0);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
+  const [sessionSortBy, setSessionSortBy] = useState<SessionSortBy>("start_time");
   const [selected, setSelected] = useState<string | null>(null);
   const [sessionDetail, setSessionDetail] = useState<Session | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -580,7 +582,12 @@ export function App() {
     try {
       setLoading(true);
       setError(null);
-      const params = new URLSearchParams({ scope: appliedScope, page: String(page), pageSize: String(pageSize) });
+      const params = new URLSearchParams({
+        scope: appliedScope,
+        page: String(page),
+        pageSize: String(pageSize),
+        sortBy: sessionSortBy,
+      });
       if (selectedTools.length > 0 && selectedTools.length < ALL_TOOLS.length) {
         params.set("tools", selectedTools.join(","));
       }
@@ -838,7 +845,7 @@ export function App() {
       return;
     }
     void fetchUsageDashboard();
-  }, [viewMode, appliedScope, appliedQuery, selectedTools, page, pageSize]);
+  }, [viewMode, appliedScope, appliedQuery, selectedTools, page, pageSize, sessionSortBy]);
 
   useEffect(() => {
     if (!loading) setSearching(false);
@@ -1105,7 +1112,7 @@ export function App() {
       </header>
 
       <div className="content">
-        <aside className="sidebar">
+        <aside className={`sidebar ${viewMode === "archive" ? "has-sort" : ""}`}>
         <div className="tool-filter">
           <div className="tool-filter-head">
             <div className="tool-filter-title">CLI 过滤</div>
@@ -1153,6 +1160,22 @@ export function App() {
           </div>
           <div className="tool-filter-tip">单击单选，按 Cmd/Ctrl/Shift 可多选</div>
         </div>
+        {viewMode === "archive" && (
+          <div className="list-sort">
+            <label htmlFor="session-sort">排序</label>
+            <select
+              id="session-sort"
+              value={sessionSortBy}
+              onChange={(e) => {
+                setSessionSortBy(e.target.value as SessionSortBy);
+                setPage(1);
+              }}
+            >
+              <option value="start_time">创建时间倒序</option>
+              <option value="end_time">最后更新倒序</option>
+            </select>
+          </div>
+        )}
         <div className="pager sidebar-pager">
           <div className="pager-row sidebar-pager-row">
             <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1}>
@@ -1210,7 +1233,10 @@ export function App() {
                   </span>
                   <span className="meta-side">
                     <span className="meta-questions">提问 {session.question_count ?? 0}</span>
-                    <span>{formatTime(session.start_time)}</span>
+                    <span>
+                      {viewMode === "archive" && sessionSortBy === "end_time" ? "更新" : "创建"}{" "}
+                      {formatTime(viewMode === "archive" && sessionSortBy === "end_time" ? session.end_time : session.start_time)}
+                    </span>
                   </span>
                 </div>
                 <div className="session-tags">
@@ -1345,6 +1371,7 @@ export function App() {
                               : selectedSession.tool}
                     </span>
                     <span className="meta-time">开始时间：{formatTime(selectedSession.start_time)}</span>
+                    <span className="meta-time">最后更新：{formatTime(selectedSession.end_time)}</span>
                   </div>
                   <div className="session-meta-grid">
                     <div className="session-meta-item">

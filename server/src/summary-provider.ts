@@ -856,14 +856,21 @@ export function buildSessionMetadataWithOptions(
 export function buildSessionMetadataForSync(
   messages: MessageRecord[],
   existing: CachedSummaryRecord | undefined,
-  options: { allowCodex?: boolean; startTime?: string | null; endTime?: string | null } = {}
+  options: {
+    allowCodex?: boolean;
+    startTime?: string | null;
+    endTime?: string | null;
+    forceSummaryRefresh?: boolean;
+  } = {}
 ): SyncSummaryResult {
   const settings = getSummarySettings();
   const contentHash = summaryContentHash(messages);
   const existingModel = existing?.summary_model || settings.model;
   const existingPromptVersion = Number(existing?.summary_prompt_version ?? 0) || SUMMARY_PROMPT_VERSION;
+  const forceSummaryRefresh = Boolean(options.forceSummaryRefresh);
 
   const stableNonRuleCached =
+    !forceSummaryRefresh &&
     existing &&
     existing.summary_content_hash === contentHash &&
     successfulNonRuleSummary(existing)
@@ -880,6 +887,7 @@ export function buildSessionMetadataForSync(
   }
 
   const cached =
+    !forceSummaryRefresh &&
     existing &&
     existing.summary_content_hash === contentHash &&
     existing.summary_model === settings.model &&
@@ -898,7 +906,9 @@ export function buildSessionMetadataForSync(
   }
 
   const remoteExpired =
-    nonRuleProvider(settings.provider) && !isWithinRemoteSummaryAge(options.startTime ?? messages[0]?.ts ?? null);
+    !forceSummaryRefresh &&
+    nonRuleProvider(settings.provider) &&
+    !isWithinRemoteSummaryAge(options.startTime ?? messages[0]?.ts ?? null);
   const expiredExisting =
     existing && remoteExpired && existing.summary_content_hash === contentHash
       ? cachedRecordToSummary(existing, "cache_remote_expired")

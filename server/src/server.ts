@@ -56,6 +56,8 @@ type SessionEnriched = SessionRow & {
   session_target: string;
 };
 
+type SessionSortBy = "start_time" | "end_time";
+
 const SESSION_SELECT_COLUMNS = `
   s.*,
   u.usage_status,
@@ -150,6 +152,18 @@ async function withDbRetry<T>(fn: () => T): Promise<T> {
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError ?? "database retry failed"));
+}
+
+function parseSessionSortBy(raw: string | undefined): SessionSortBy {
+  return raw === "end_time" ? "end_time" : "start_time";
+}
+
+function sessionOrderByClause(sortBy: SessionSortBy, qualifier = ""): string {
+  const prefix = qualifier ? `${qualifier}.` : "";
+  if (sortBy === "end_time") {
+    return `${prefix}end_time DESC, ${prefix}start_time DESC, ${prefix}id DESC`;
+  }
+  return `${prefix}start_time DESC, ${prefix}id DESC`;
 }
 
 function buildResumeHint(
@@ -540,17 +554,18 @@ app.post("/api/reindex/session", async (request, reply) => {
 
   db.prepare("DELETE FROM ingest_state WHERE source_path = ?").run(row.source_path);
   const onlyPaths = new Set([row.source_path]);
+  const syncOptions = { onlyPaths, forceSummaryRefresh: true };
   const stats =
     row.tool === "codex"
-      ? syncCodexSessions(undefined, { onlyPaths })
+      ? syncCodexSessions(undefined, syncOptions)
       : row.tool === "claude"
-        ? syncClaudeSessions(undefined, { onlyPaths })
+        ? syncClaudeSessions(undefined, syncOptions)
         : row.tool === "copilot"
-          ? syncCopilotSessions(undefined, { onlyPaths })
+          ? syncCopilotSessions(undefined, syncOptions)
           : row.tool === "gemini"
-            ? syncGeminiSessions(undefined, { onlyPaths })
+            ? syncGeminiSessions(undefined, syncOptions)
             : row.tool === "opencode"
-              ? syncOpencodeSessions(undefined, { onlyPaths })
+              ? syncOpencodeSessions(undefined, syncOptions)
             : null;
   if (!stats) {
     reply.code(400);
@@ -669,6 +684,9 @@ app.get("/api/sessions", async (request, reply) => {
   const page = Math.max(1, Number((request.query as Record<string, string | undefined>).page ?? "1"));
   const pageSize = Math.min(100, Math.max(1, Number((request.query as Record<string, string | undefined>).pageSize ?? "20")));
   const offset = (page - 1) * pageSize;
+  const sortBy = parseSessionSortBy((request.query as Record<string, string | undefined>).sortBy);
+  const sessionOrder = sessionOrderByClause(sortBy, "s");
+  const resultOrder = sessionOrderByClause(sortBy);
   const toolClause =
     toolFilters.length === 0 ? "" : `AND s.tool IN (${new Array(toolFilters.length).fill("?").join(",")})`;
   const purposeSettings = getPurposeSettings();
@@ -681,7 +699,7 @@ app.get("/api/sessions", async (request, reply) => {
            FROM sessions s
            LEFT JOIN session_usage_summary u ON u.session_id = s.id
            WHERE 1=1 ${toolClause}
-           ORDER BY datetime(start_time) DESC LIMIT ? OFFSET ?`
+           ORDER BY ${sessionOrder} LIMIT ? OFFSET ?`
         )
         .all(...toolFilters, pageSize, offset)
     )) as SessionRow[];
@@ -899,7 +917,7 @@ app.get("/api/sessions", async (request, reply) => {
         question_count,
         created_at,
         updated_at
-      ORDER BY datetime(start_time) DESC
+      ORDER BY ${resultOrder}
       LIMIT ? OFFSET ?
     `
           )
@@ -1094,7 +1112,7 @@ app.get("/api/sessions", async (request, reply) => {
         question_count,
         created_at,
         updated_at
-      ORDER BY datetime(start_time) DESC
+      ORDER BY ${resultOrder}
       LIMIT ? OFFSET ?
     `
           )

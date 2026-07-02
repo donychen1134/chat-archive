@@ -1,4 +1,3 @@
-import { estimateTotalSourceFiles } from "./sync.js";
 import type { SyncProgress, SyncStats } from "./types.js";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -77,7 +76,6 @@ function resetForStart(mode: SyncMode) {
   state.warningDetails = [];
   state.currentFile = "";
   state.lastError = "";
-  state.totalFiles = estimateTotalSourceFiles();
 }
 
 function applyProgress(progress: SyncProgress) {

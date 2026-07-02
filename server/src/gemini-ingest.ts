@@ -195,10 +195,11 @@ function fileToSessionId(root: string, filePath: string, hint: string | null, pr
 
 export function syncGeminiSessions(
   onProgress?: (progress: SyncProgress) => void,
-  options?: { onlyPaths?: Set<string> }
+  options?: { onlyPaths?: Set<string>; forceSummaryRefresh?: boolean }
 ): SyncStats {
   const root = geminiSessionsDir();
   const onlyPaths = options?.onlyPaths;
+  const forceSummaryRefresh = Boolean(options?.forceSummaryRefresh);
   const files = walkGeminiFiles(root).filter((p) => !onlyPaths || onlyPaths.has(p));
   const settings = getSummarySettings();
   let codexBudget = settings.provider === "hybrid" ? settings.codexLimitPerRun : Number.MAX_SAFE_INTEGER;
@@ -283,7 +284,12 @@ export function syncGeminiSessions(
     const durationSec = Math.max(0, Math.floor((new Date(end).valueOf() - new Date(start).valueOf()) / 1000));
     const allowCodex = settings.provider !== "hybrid" || codexBudget > 0;
     const existing = getExistingSession.get(sessionId) as CachedSummaryRecord | undefined;
-    const metadata = buildSessionMetadataForSync(messages, existing, { allowCodex, startTime: start, endTime: end });
+    const metadata = buildSessionMetadataForSync(messages, existing, {
+      allowCodex,
+      startTime: start,
+      endTime: end,
+      forceSummaryRefresh,
+    });
     if (!metadata.fromCache && metadata.providerUsed === "codex" && settings.provider === "hybrid" && codexBudget > 0) {
       codexBudget -= 1;
     }

@@ -178,6 +178,12 @@ CREATE INDEX IF NOT EXISTS idx_usage_records_tool ON usage_records(tool);
 CREATE INDEX IF NOT EXISTS idx_session_usage_summary_tool ON session_usage_summary(tool);
 CREATE INDEX IF NOT EXISTS idx_session_usage_summary_total_tokens ON session_usage_summary(total_tokens);
 CREATE INDEX IF NOT EXISTS idx_sessions_summary_cache ON sessions(summary_content_hash, summary_model, summary_prompt_version);
+CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON sessions(start_time DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_end_time ON sessions(end_time DESC, start_time DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_tool_start_time ON sessions(tool, start_time DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_tool_end_time ON sessions(tool, end_time DESC, start_time DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_session_role ON messages(session_id, role);
+CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq_in_session);
 `);
 
 export function nowIso(): string {

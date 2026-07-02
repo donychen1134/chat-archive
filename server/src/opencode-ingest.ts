@@ -280,9 +280,10 @@ function parseSessionMessages(
 
 export function syncOpencodeSessions(
   onProgress?: (progress: SyncProgress) => void,
-  options?: { onlyPaths?: Set<string> }
+  options?: { onlyPaths?: Set<string>; forceSummaryRefresh?: boolean }
 ): SyncStats {
   const file = opencodeDbPath();
+  const forceSummaryRefresh = Boolean(options?.forceSummaryRefresh);
   const stats: SyncStats = {
     scannedFiles: 0,
     updatedSessions: 0,
@@ -403,7 +404,12 @@ export function syncOpencodeSessions(
       const allowCodex = settings.provider !== "hybrid" || codexBudget > 0;
       const sessionPk = `opencode:${session.id}`;
       const existing = getExistingSession.get(sessionPk) as CachedSummaryRecord | undefined;
-      const metadata = buildSessionMetadataForSync(parsed.messages, existing, { allowCodex, startTime: start, endTime: end });
+      const metadata = buildSessionMetadataForSync(parsed.messages, existing, {
+        allowCodex,
+        startTime: start,
+        endTime: end,
+        forceSummaryRefresh,
+      });
       if (!metadata.fromCache && metadata.providerUsed === "codex" && settings.provider === "hybrid" && codexBudget > 0) {
         codexBudget -= 1;
       }
