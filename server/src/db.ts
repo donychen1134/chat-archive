@@ -186,6 +186,31 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_role ON messages(session_id, rol
 CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq_in_session);
 `);
 
+const cachedStatusPrefixes = /^(?:(?:cache_non_rule|cache_hit|cache_remote_expired|cache_inactive):)+/i;
+const pollutedStatuses = db
+  .prepare(
+    `SELECT id, summary_status, summary_provider
+     FROM sessions
+     WHERE summary_status LIKE 'cache_non_rule:%'
+        OR summary_status LIKE 'cache_hit:%'
+        OR summary_status LIKE 'cache_remote_expired:%'
+        OR summary_status LIKE 'cache_inactive:%'`
+  )
+  .all() as Array<{ id: string; summary_status: string; summary_provider: string }>;
+if (pollutedStatuses.length > 0) {
+  const updateStatus = db.prepare("UPDATE sessions SET summary_status = ? WHERE id = ?");
+  const cleanStatuses = db.transaction(
+    (rows: Array<{ id: string; summary_status: string; summary_provider: string }>) => {
+      for (const row of rows) {
+        const cleaned = row.summary_status.replace(cachedStatusPrefixes, "");
+        const fallback = row.summary_provider === "rule" ? "rule_only" : `${row.summary_provider}_ok`;
+        updateStatus.run(cleaned || fallback, row.id);
+      }
+    }
+  );
+  cleanStatuses(pollutedStatuses);
+}
+
 export function nowIso(): string {
   return new Date().toISOString();
 }

@@ -19,6 +19,15 @@ import { testCodexSummaryConnection } from "./summary-provider.js";
 import { getSyncTaskState, startSyncTask } from "./sync-manager.js";
 import { computeUsageContributions } from "./usage.js";
 import type { UsageInput } from "./types.js";
+import {
+  buildFtsAnyQuery,
+  escapeLikeToken,
+  excerptAroundTokens,
+  MAX_SEARCH_TOKENS,
+  parseBoundedPositiveInt,
+  quoteFtsToken,
+  tokenizeSearchInput,
+} from "./search-utils.js";
 
 const app = Fastify({ logger: false });
 const port = Number(process.env.PORT ?? 8765);
@@ -117,21 +126,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function tokenizeSearchInput(raw: string): string[] {
-  return raw
-    .trim()
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length > 0);
-}
-
-function buildFtsMatchQuery(raw: string): string {
-  const tokens = tokenizeSearchInput(raw);
-  if (tokens.length === 0) return "";
-  const quoted = tokens.map((token) => `"${token.replaceAll(`"`, `""`)}"`);
-  return quoted.join(" AND ");
-}
-
 function isFtsQuerySyntaxError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const message = String((error as { message?: unknown }).message ?? "").toLowerCase();
@@ -164,6 +158,74 @@ function sessionOrderByClause(sortBy: SessionSortBy, qualifier = ""): string {
     return `${prefix}end_time DESC, ${prefix}start_time DESC, ${prefix}id DESC`;
   }
   return `${prefix}start_time DESC, ${prefix}id DESC`;
+}
+
+const SEARCH_META_COLUMNS = [
+  "title",
+  "summary",
+  "session_purpose",
+  "session_target",
+  "session_outcome",
+  "keywords_json",
+  "entities_json",
+  "project",
+  "source_path",
+] as const;
+
+function metadataLikeClause(alias: string): string {
+  return SEARCH_META_COLUMNS.map((column) => `COALESCE(${alias}.${column},'') LIKE ? ESCAPE '\\'`).join(" OR ");
+}
+
+function buildAllScopeSessionMatch(tokens: string[]): { sql: string; params: string[] } {
+  const params: string[] = [];
+  const tokenSets = tokens.map((token) => {
+    const like = escapeLikeToken(token);
+    params.push(quoteFtsToken(token), ...SEARCH_META_COLUMNS.map(() => like));
+    return `SELECT id FROM (
+      SELECT session_id AS id FROM message_fts WHERE content MATCH ?
+      UNION
+      SELECT s.id FROM sessions s WHERE (${metadataLikeClause("s")})
+    )`;
+  });
+  return { sql: tokenSets.length > 0 ? tokenSets.join(" INTERSECT ") : "SELECT NULL AS id WHERE 0", params };
+}
+
+function buildScopedSessionMatch(
+  tokens: string[],
+  role: "user" | "assistant",
+): { sql: string; params: string[] } {
+  return {
+    sql: tokens
+      .map(() => `SELECT session_id AS id FROM message_fts WHERE role = '${role}' AND content MATCH ?`)
+      .join(" INTERSECT "),
+    params: tokens.map(quoteFtsToken),
+  };
+}
+
+function metadataAnyMatch(tokens: string[], alias = "s"): { sql: string; params: string[] } {
+  const params: string[] = [];
+  const clauses = tokens.map((token) => {
+    const like = escapeLikeToken(token);
+    params.push(...SEARCH_META_COLUMNS.map(() => like));
+    return `(${metadataLikeClause(alias)})`;
+  });
+  return { sql: clauses.length > 0 ? clauses.join(" OR ") : "0", params };
+}
+
+function withAccurateSearchExcerpt(row: SessionRow, tokens: string[]): SessionRow {
+  const excerpt = typeof row.hit_excerpt === "string" ? row.hit_excerpt.trim() : "";
+  const lowerExcerpt = excerpt.toLowerCase();
+  if (excerpt && tokens.some((token) => lowerExcerpt.includes(token.toLowerCase()))) {
+    return { ...row, hit_excerpt: excerptAroundTokens(excerpt, tokens) };
+  }
+  for (const column of SEARCH_META_COLUMNS) {
+    const value = typeof row[column] === "string" ? row[column].trim() : "";
+    const lower = value.toLowerCase();
+    if (value && tokens.some((token) => lower.includes(token.toLowerCase()))) {
+      return { ...row, hit_excerpt: excerptAroundTokens(value, tokens) };
+    }
+  }
+  return row;
 }
 
 function buildResumeHint(
@@ -657,12 +719,14 @@ app.post("/api/purpose/reclassify", async () => {
 
 app.get("/api/sessions", async (request, reply) => {
   const query = (request.query as Record<string, string | undefined>).query?.trim() ?? "";
-  const ftsQuery = buildFtsMatchQuery(query);
-  const likeQuery = `%${query.replace(/[%_]/g, "\\$&")}%`;
-  const scope = ((request.query as Record<string, string | undefined>).scope ?? "all") as
-    | "all"
-    | "question"
-    | "answer";
+  const tokens = tokenizeSearchInput(query);
+  const ftsQuery = buildFtsAnyQuery(tokens);
+  const rawScope = (request.query as Record<string, string | undefined>).scope;
+  if (rawScope && rawScope !== "all" && rawScope !== "question" && rawScope !== "answer") {
+    reply.status(400);
+    return { error: "scope 仅支持 all、question 或 answer。" };
+  }
+  const scope = rawScope === "question" || rawScope === "answer" ? rawScope : "all";
   const tool = ((request.query as Record<string, string | undefined>).tool ?? "all") as
     | "all"
     | "codex"
@@ -681,8 +745,8 @@ app.get("/api/sessions", async (request, reply) => {
   const legacyTool =
     tool === "codex" || tool === "claude" || tool === "copilot" || tool === "gemini" || tool === "opencode" ? [tool] : [];
   const toolFilters = Array.from(new Set([...(fromTools.length > 0 ? fromTools : legacyTool)]));
-  const page = Math.max(1, Number((request.query as Record<string, string | undefined>).page ?? "1"));
-  const pageSize = Math.min(100, Math.max(1, Number((request.query as Record<string, string | undefined>).pageSize ?? "20")));
+  const page = parseBoundedPositiveInt((request.query as Record<string, string | undefined>).page, 1, 1_000_000);
+  const pageSize = parseBoundedPositiveInt((request.query as Record<string, string | undefined>).pageSize, 20, 100);
   const offset = (page - 1) * pageSize;
   const sortBy = parseSessionSortBy((request.query as Record<string, string | undefined>).sortBy);
   const sessionOrder = sessionOrderByClause(sortBy, "s");
@@ -711,11 +775,23 @@ app.get("/api/sessions", async (request, reply) => {
     return { items: rows.map((row) => withResumeHint(row, purposeSettings)), total: total.c };
   }
 
-  if (!ftsQuery && scope !== "all") {
+  if (tokens.length === 0) {
     return { items: [], total: 0 };
+  }
+  if (tokens.length > MAX_SEARCH_TOKENS) {
+    reply.status(400);
+    return { error: `搜索关键词不能超过 ${MAX_SEARCH_TOKENS} 个。` };
   }
 
   const roleFilter = scope === "question" ? "AND f.role = 'user'" : scope === "answer" ? "AND f.role = 'assistant'" : "";
+  const allSessionMatch = buildAllScopeSessionMatch(tokens);
+  const metaAnyMatch = metadataAnyMatch(tokens);
+  const scopedSessionMatch =
+    scope === "question"
+      ? buildScopedSessionMatch(tokens, "user")
+      : scope === "answer"
+        ? buildScopedSessionMatch(tokens, "assistant")
+        : null;
 
   let rows: SessionRow[] = [];
   let total: { c: number } = { c: 0 };
@@ -725,7 +801,13 @@ app.get("/api/sessions", async (request, reply) => {
         db
           .prepare(
             `
-      WITH matched AS (
+      WITH eligible AS (
+        SELECT token_match.id
+        FROM (${allSessionMatch.sql}) token_match
+        JOIN sessions s ON s.id = token_match.id
+        WHERE 1=1 ${toolClause}
+      ),
+      matched AS (
         SELECT
           s.id AS session_id,
           s.tool,
@@ -766,11 +848,12 @@ app.get("/api/sessions", async (request, reply) => {
           s.created_at,
           s.updated_at,
           f.role AS hit_role,
-          substr(f.content, 1, 120) AS hit_excerpt
+          snippet(message_fts, 3, '', '', ' … ', 24) AS hit_excerpt
         FROM sessions s
+        JOIN eligible e ON e.id = s.id
         LEFT JOIN session_usage_summary u ON u.session_id = s.id
         JOIN message_fts f ON f.session_id = s.id
-        WHERE f.content MATCH ? ${toolClause}
+        WHERE f.content MATCH ?
         UNION ALL
         SELECT
           s.id AS session_id,
@@ -827,18 +910,9 @@ app.get("/api/sessions", async (request, reply) => {
             1, 120
           ) AS hit_excerpt
         FROM sessions s
+        JOIN eligible e ON e.id = s.id
         LEFT JOIN session_usage_summary u ON u.session_id = s.id
-        WHERE (
-          s.title LIKE ? ESCAPE '\\' OR
-          s.summary LIKE ? ESCAPE '\\' OR
-          COALESCE(s.session_purpose,'') LIKE ? ESCAPE '\\' OR
-          COALESCE(s.session_target,'') LIKE ? ESCAPE '\\' OR
-          COALESCE(s.session_outcome,'') LIKE ? ESCAPE '\\' OR
-          COALESCE(s.keywords_json,'') LIKE ? ESCAPE '\\' OR
-          COALESCE(s.entities_json,'') LIKE ? ESCAPE '\\' OR
-          COALESCE(s.project,'') LIKE ? ESCAPE '\\' OR
-          s.source_path LIKE ? ESCAPE '\\'
-        ) ${toolClause}
+        WHERE (${metaAnyMatch.sql})
       )
       SELECT
         session_id AS id,
@@ -922,18 +996,10 @@ app.get("/api/sessions", async (request, reply) => {
     `
           )
           .all(
+            ...allSessionMatch.params,
+            ...toolFilters,
             ftsQuery,
-            ...toolFilters,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            ...toolFilters,
+            ...metaAnyMatch.params,
             pageSize,
             offset
           )
@@ -943,52 +1009,38 @@ app.get("/api/sessions", async (request, reply) => {
         db
           .prepare(
             `
-      WITH matched_ids AS (
-        SELECT s.id
-        FROM sessions s
-        JOIN message_fts f ON f.session_id = s.id
-        WHERE f.content MATCH ? ${toolClause}
-        UNION
-        SELECT s.id
-        FROM sessions s
-        WHERE (
-          s.title LIKE ? ESCAPE '\\' OR
-          s.summary LIKE ? ESCAPE '\\' OR
-          COALESCE(s.session_purpose,'') LIKE ? ESCAPE '\\' OR
-          COALESCE(s.session_target,'') LIKE ? ESCAPE '\\' OR
-          COALESCE(s.session_outcome,'') LIKE ? ESCAPE '\\' OR
-          COALESCE(s.keywords_json,'') LIKE ? ESCAPE '\\' OR
-          COALESCE(s.entities_json,'') LIKE ? ESCAPE '\\' OR
-          COALESCE(s.project,'') LIKE ? ESCAPE '\\' OR
-          s.source_path LIKE ? ESCAPE '\\'
-        ) ${toolClause}
+      WITH eligible AS (
+        SELECT token_match.id
+        FROM (${allSessionMatch.sql}) token_match
+        JOIN sessions s ON s.id = token_match.id
+        WHERE 1=1 ${toolClause}
       )
-      SELECT COUNT(*) as c FROM matched_ids
+      SELECT COUNT(*) as c FROM eligible
     `
           )
           .get(
-            ftsQuery,
-            ...toolFilters,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
-            likeQuery,
+            ...allSessionMatch.params,
             ...toolFilters
           )
       )) as { c: number };
     } else {
-      const queryParams = [ftsQuery, ...toolFilters, pageSize, offset];
-      const totalParams = [ftsQuery, ...toolFilters];
+      if (!scopedSessionMatch) {
+        reply.status(400);
+        return { error: "搜索范围不合法。" };
+      }
+      const queryParams = [...scopedSessionMatch.params, ...toolFilters, ftsQuery, pageSize, offset];
+      const totalParams = [...scopedSessionMatch.params, ...toolFilters];
       rows = (await withDbRetry(() =>
         db
           .prepare(
             `
-      WITH matched AS (
+      WITH eligible AS (
+        SELECT token_match.id
+        FROM (${scopedSessionMatch.sql}) token_match
+        JOIN sessions s ON s.id = token_match.id
+        WHERE 1=1 ${toolClause}
+      ),
+      matched AS (
         SELECT
           s.id AS session_id,
           s.tool,
@@ -1029,11 +1081,12 @@ app.get("/api/sessions", async (request, reply) => {
           s.created_at,
           s.updated_at,
           f.role AS hit_role,
-          substr(f.content, 1, 120) AS hit_excerpt
+          f.content AS hit_excerpt
         FROM sessions s
+        JOIN eligible e ON e.id = s.id
         LEFT JOIN session_usage_summary u ON u.session_id = s.id
         JOIN message_fts f ON f.session_id = s.id
-        WHERE f.content MATCH ? ${roleFilter} ${toolClause}
+        WHERE f.content MATCH ? ${roleFilter}
       )
       SELECT
         session_id AS id,
@@ -1123,10 +1176,13 @@ app.get("/api/sessions", async (request, reply) => {
         db
           .prepare(
             `
-      SELECT COUNT(DISTINCT s.id) as c
-      FROM sessions s
-      JOIN message_fts f ON f.session_id = s.id
-      WHERE f.content MATCH ? ${roleFilter} ${toolClause}
+      WITH eligible AS (
+        SELECT token_match.id
+        FROM (${scopedSessionMatch.sql}) token_match
+        JOIN sessions s ON s.id = token_match.id
+        WHERE 1=1 ${toolClause}
+      )
+      SELECT COUNT(*) as c FROM eligible
     `
           )
           .get(...totalParams)
@@ -1140,7 +1196,10 @@ app.get("/api/sessions", async (request, reply) => {
     throw error;
   }
 
-  return { items: rows.map((row) => withResumeHint(row, purposeSettings)), total: total.c };
+  return {
+    items: rows.map((row) => withResumeHint(withAccurateSearchExcerpt(row, tokens), purposeSettings)),
+    total: total.c,
+  };
 });
 
 app.get("/api/usage/overview", async (request) => {

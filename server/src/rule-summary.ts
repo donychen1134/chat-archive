@@ -1,4 +1,5 @@
 import type { MessageRecord } from "./types.js";
+import { effectiveConversationMessages } from "./message-cleaning.js";
 
 const STOP_WORDS_EN = new Set([
   "the",
@@ -69,30 +70,11 @@ const STOP_WORDS_CN = new Set([
   "修复",
   "优化",
   "功能",
+  "项目",
 ]);
 
-function isBoilerplate(text: string): boolean {
-  const value = text.toLowerCase();
-  return (
-    value.includes("<permissions instructions>") ||
-    value.includes("<instructions>") ||
-    value.includes("# agents.md instructions") ||
-    value.includes("<environment_context>") ||
-    value.includes("<collaboration_mode>") ||
-    value.includes("<cwd>") ||
-    value.includes("</cwd>") ||
-    value.includes("<user_shell_command>") ||
-    value.includes("approved command prefix saved")
-  );
-}
-
 function effectiveMessages(messages: MessageRecord[]): MessageRecord[] {
-  return messages.filter((m) => {
-    if (m.role !== "user" && m.role !== "assistant") return false;
-    if (!m.content.trim()) return false;
-    if (isBoilerplate(m.content)) return false;
-    return true;
-  });
+  return effectiveConversationMessages(messages);
 }
 
 function normalizedLine(value: string): string {
@@ -213,12 +195,16 @@ function topKeywords(text: string, max = 4): string[] {
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
-    .filter((w) => w.length >= 4 && !STOP_WORDS_EN.has(w));
-  const cnWords = (text.match(/[\u4e00-\u9fff]{2,12}/g) ?? []).filter(
-    (w) => !STOP_WORDS_CN.has(w)
-  );
+    .filter((w) => w.length >= 3 && w.length <= 48 && !/^(.)\1{7,}$/.test(w) && !STOP_WORDS_EN.has(w));
+  const cnWords = (text.match(/[\u4e00-\u9fff]{2,12}/g) ?? [])
+    .map((word) =>
+      word
+        .replace(/^(?:(?:请问|麻烦|帮我|帮忙|请|重新|当前|这个|那个|一下|评估|检查|查看|下))+/g, "")
+        .replace(/(?:是否有|怎么样|怎么做|是什么|如何|一下)$/g, "")
+    )
+    .filter((word) => word.length >= 2 && !/^(?:是否|有没有|有待)/.test(word) && !STOP_WORDS_CN.has(word));
   const score = new Map<string, number>();
-  for (const word of [...cnWords, ...enWords]) {
+  for (const word of [...enWords, ...cnWords]) {
     score.set(word, (score.get(word) ?? 0) + 1);
   }
   return [...score.entries()]
@@ -229,11 +215,11 @@ function topKeywords(text: string, max = 4): string[] {
 
 export function buildTitleAndSummary(messages: MessageRecord[]): { title: string; summary: string } {
   const effective = effectiveMessages(messages);
-  const titleSource = effective.length > 0 ? effective : messages.filter((m) => m.role === "user" || m.role === "assistant");
+  const titleSource = effective;
   const firstLine = pickBestTitle(titleSource);
   const title = trimTitle(firstLine);
 
-  const joined = (effective.length > 0 ? effective : messages.filter((m) => m.role === "user" || m.role === "assistant"))
+  const joined = effective
     .slice(0, 12)
     .map((m) => m.content)
     .join("\n");

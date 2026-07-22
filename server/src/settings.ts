@@ -68,6 +68,13 @@ function getNumber(key: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function getNonNegativeNumber(key: string, fallback: number): number {
+  const row = getStmt.get(key) as { value: string } | undefined;
+  if (!row) return fallback;
+  const n = Number(row.value);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 export function getSummarySettings(): SummarySettings {
   const provider = getString("summary.provider", DEFAULTS.provider);
   return {
@@ -83,7 +90,7 @@ export function getSummarySettings(): SummarySettings {
               : "codex",
     model: getString("summary.model", DEFAULTS.model),
     timeoutMs: getNumber("summary.timeout_ms", DEFAULTS.timeoutMs),
-    codexLimitPerRun: getNumber("summary.codex_limit_per_run", DEFAULTS.codexLimitPerRun),
+    codexLimitPerRun: getNonNegativeNumber("summary.codex_limit_per_run", DEFAULTS.codexLimitPerRun),
     lastError: getString("summary.last_error", DEFAULTS.lastError),
   };
 }

@@ -10,6 +10,7 @@
     "build": "npm-run-all build:server build:web",
     "build:server": "npm --prefix server run build",
     "build:web": "npm --prefix web run build",
+    "test": "npm --prefix server test",
     "sync": "npm --prefix server run sync",
     "ui": "npm --prefix server run dev"
   },

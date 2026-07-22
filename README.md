@@ -28,6 +28,7 @@ All data is stored locally in SQLite.
   - `question` (user messages)
   - `answer` (assistant messages)
   - `all` (full text)
+- Space-separated search terms use session-level AND semantics, so terms may match different messages or metadata fields in one session.
 - Session list with CLI badges and pagination
 - Turn-based detail view with collapse/expand
 - Optional hide/show system/tool messages
@@ -73,6 +74,7 @@ npm run dev
 
 ```bash
 npm run build
+npm test
 ```
 
 ## Common Commands
@@ -117,6 +119,7 @@ Summary-related:
 - `CHAT_ARCHIVE_SUMMARY_MODEL` (default: `gpt-5-codex`)
 - `CHAT_ARCHIVE_SUMMARY_TIMEOUT_MS` (default: `30000`)
 - `CHAT_ARCHIVE_CODEX_LIMIT_PER_RUN` (default: `8`)
+- `CHAT_ARCHIVE_REMOTE_SUMMARY_MAX_AGE_DAYS` (default: `5`, based on the session's latest activity)
 - `CHAT_ARCHIVE_QWEN_API_KEY` (or `DASHSCOPE_API_KEY`)
 - `CHAT_ARCHIVE_QWEN_BASE_URL` (default: `https://dashscope.aliyuncs.com/compatible-mode/v1`)
 - `CHAT_ARCHIVE_FRIDAY_APP_ID` (or local app_config `friday.app_id`)

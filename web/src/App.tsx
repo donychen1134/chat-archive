@@ -266,13 +266,13 @@ function escapeRegExp(value: string): string {
 }
 
 function highlightText(text: string, query: string): ReactNode {
-  const q = query.trim();
-  if (!q) return text;
-  const regex = new RegExp(`(${escapeRegExp(q)})`, "ig");
+  const tokens = Array.from(new Set(query.trim().split(/\s+/).filter(Boolean)));
+  if (tokens.length === 0) return text;
+  const regex = new RegExp(`(${tokens.map(escapeRegExp).sort((a, b) => b.length - a.length).join("|")})`, "ig");
   const parts = text.split(regex);
-  const qLower = q.toLowerCase();
+  const lowerTokens = new Set(tokens.map((token) => token.toLowerCase()));
   return parts.map((part, idx) =>
-    part.toLowerCase() === qLower ? (
+    lowerTokens.has(part.toLowerCase()) ? (
       <mark key={idx} className="hl">
         {part}
       </mark>

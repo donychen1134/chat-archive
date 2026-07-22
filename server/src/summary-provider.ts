@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import type { MessageRecord } from "./types.js";
 import { buildTitleAndSummary } from "./rule-summary.js";
+import { effectiveConversationMessages } from "./message-cleaning.js";
 import { getFridayAppId, getSummarySettings, setSummaryLastError, type SummaryProvider } from "./settings.js";
 
 export type SummaryResult = {
@@ -48,26 +49,8 @@ let codexCircuitUntilMs = 0;
 let codexCircuitReason = "";
 let codexConsecutiveFailures = 0;
 
-function isBoilerplate(text: string): boolean {
-  const value = text.toLowerCase();
-  return (
-    value.includes("<permissions instructions>") ||
-    value.includes("<instructions>") ||
-    value.includes("# agents.md instructions") ||
-    value.includes("<environment_context>") ||
-    value.includes("<collaboration_mode>") ||
-    value.includes("<cwd>") ||
-    value.includes("</cwd>") ||
-    value.includes("<user_shell_command>") ||
-    value.includes("approved command prefix saved")
-  );
-}
-
 function effectiveMessages(messages: MessageRecord[]): MessageRecord[] {
-  return messages
-    .filter((m) => m.role === "user" || m.role === "assistant")
-    .filter((m) => m.content.trim().length > 0)
-    .filter((m) => !isBoilerplate(m.content));
+  return effectiveConversationMessages(messages);
 }
 
 function pickEffectiveMessages(messages: MessageRecord[]): MessageRecord[] {
@@ -84,11 +67,34 @@ function pickEffectiveMessages(messages: MessageRecord[]): MessageRecord[] {
   });
 }
 
-function conversationForPrompt(messages: MessageRecord[]): string {
-  return pickEffectiveMessages(messages)
-    .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
-    .join("\n\n")
-    .slice(0, 12000);
+function truncatePromptEntry(entry: string, max: number): string {
+  if (entry.length <= max) return entry;
+  const head = Math.max(1, Math.floor(max * 0.6));
+  const tail = Math.max(1, max - head - 16);
+  return `${entry.slice(0, head)}\n…[truncated]…\n${entry.slice(-tail)}`;
+}
+
+function fitPromptEntries(entries: string[], budget: number): string[] {
+  if (entries.length === 0 || budget <= 0) return [];
+  const separatorCost = Math.max(0, entries.length - 1) * 2;
+  const perEntry = Math.max(240, Math.floor((budget - separatorCost) / entries.length));
+  return entries.map((entry) => truncatePromptEntry(entry, perEntry));
+}
+
+export function conversationForPrompt(messages: MessageRecord[]): string {
+  const entries = pickEffectiveMessages(messages).map((m) => `${m.role.toUpperCase()}: ${m.content}`);
+  if (entries.length === 0) return "";
+  const joined = entries.join("\n\n");
+  if (joined.length <= 12000) return joined;
+
+  const firstCount = Math.min(6, entries.length);
+  const first = entries.slice(0, firstCount);
+  const last = entries.slice(firstCount);
+  const fitted = [
+    ...fitPromptEntries(first, last.length > 0 ? 4200 : 12000),
+    ...fitPromptEntries(last, 7600),
+  ];
+  return fitted.join("\n\n").slice(0, 12000);
 }
 
 export function summaryContentHash(messages: MessageRecord[]): string {
@@ -248,11 +254,18 @@ function providerFromCache(value: string | null | undefined): SummaryProvider {
     : "rule";
 }
 
-function cachedRecordToSummary(existing: CachedSummaryRecord, statusPrefix: string): SummaryResult | null {
+function stableSummaryStatus(existing: CachedSummaryRecord): string {
+  const raw = cleanText(existing.summary_status ?? "", 500);
+  const status = raw.replace(/^(?:(?:cache_non_rule|cache_hit|cache_remote_expired|cache_inactive):)+/i, "");
+  if (status) return status;
+  const provider = providerFromCache(existing.summary_provider);
+  return provider === "rule" ? "rule_only" : `${provider}_ok`;
+}
+
+function cachedRecordToSummary(existing: CachedSummaryRecord): SummaryResult | null {
   const title = sanitizeTitle(existing.title ?? "");
   const summary = cleanText(existing.summary ?? "", 500);
   if (!title || !summary) return null;
-  const status = cleanText(existing.summary_status ?? "", 420);
   return {
     title,
     summary,
@@ -262,26 +275,24 @@ function cachedRecordToSummary(existing: CachedSummaryRecord, statusPrefix: stri
     keywords: cleanStringArray(parseJsonArray(existing.keywords_json), 8, 48),
     entities: cleanEntities(parseJsonArray(existing.entities_json)),
     providerUsed: providerFromCache(existing.summary_provider),
-    status: `${statusPrefix}${status ? `:${status}` : ""}`.slice(0, 500),
+    status: stableSummaryStatus(existing),
   };
 }
 
+function providerMatchesSettings(existingProvider: SummaryProvider, provider: SummaryProvider): boolean {
+  if (provider === "hybrid") return existingProvider === "codex";
+  return existingProvider === provider;
+}
+
 function canUseStrongCache(existing: CachedSummaryRecord, provider: SummaryProvider): boolean {
-  const status = (existing.summary_status ?? "").toLowerCase();
+  const status = stableSummaryStatus(existing).toLowerCase();
   if (status.startsWith("fallback_rule")) return false;
   const cachedProvider = providerFromCache(existing.summary_provider);
-  if (cachedProvider === "rule" && provider !== "rule") return false;
-  return true;
+  return providerMatchesSettings(cachedProvider, provider);
 }
 
 function nonRuleProvider(provider: SummaryProvider): boolean {
   return provider !== "rule";
-}
-
-function successfulNonRuleSummary(existing: CachedSummaryRecord): boolean {
-  const status = (existing.summary_status ?? "").toLowerCase();
-  const provider = providerFromCache(existing.summary_provider);
-  return provider !== "rule" && !status.startsWith("fallback_rule");
 }
 
 function remoteSummaryMaxAgeMs(): number {
@@ -290,10 +301,10 @@ function remoteSummaryMaxAgeMs(): number {
   return days * 24 * 60 * 60 * 1000;
 }
 
-function isWithinRemoteSummaryAge(startTime: string | null | undefined): boolean {
+function isWithinRemoteSummaryAge(activityTime: string | null | undefined): boolean {
   const windowMs = remoteSummaryMaxAgeMs();
   if (windowMs === 0) return false;
-  const ts = startTime ? new Date(startTime).valueOf() : Date.now();
+  const ts = activityTime ? new Date(activityTime).valueOf() : Date.now();
   if (!Number.isFinite(ts)) return true;
   return Date.now() - ts <= windowMs;
 }
@@ -328,6 +339,10 @@ function withRuleMetadata(base: { title: string; summary: string }): Omit<Summar
     keywords: parseKeywordsFromSummary(base.summary),
     entities: [],
   };
+}
+
+function fallbackRuleStatus(error: string): string {
+  return `fallback_rule:${cleanText(error || "unknown error", 480)}`.slice(0, 500);
 }
 
 function metadataPrompt(content: string): string {
@@ -808,7 +823,7 @@ export function buildSessionMetadataWithOptions(
     return {
       ...fallback,
       providerUsed: "rule",
-      status: `fallback_rule:${byQwen.error || "unknown error"}`,
+      status: fallbackRuleStatus(byQwen.error),
     };
   }
 
@@ -823,7 +838,7 @@ export function buildSessionMetadataWithOptions(
     return {
       ...fallback,
       providerUsed: "rule",
-      status: `fallback_rule:${byFriday.error || "unknown error"}`,
+      status: fallbackRuleStatus(byFriday.error),
     };
   }
 
@@ -849,7 +864,7 @@ export function buildSessionMetadataWithOptions(
   return {
     ...fallback,
     providerUsed: "rule",
-    status: `fallback_rule:${byCodex.error || "unknown error"}`,
+    status: fallbackRuleStatus(byCodex.error),
   };
 }
 
@@ -869,23 +884,6 @@ export function buildSessionMetadataForSync(
   const existingPromptVersion = Number(existing?.summary_prompt_version ?? 0) || SUMMARY_PROMPT_VERSION;
   const forceSummaryRefresh = Boolean(options.forceSummaryRefresh);
 
-  const stableNonRuleCached =
-    !forceSummaryRefresh &&
-    existing &&
-    existing.summary_content_hash === contentHash &&
-    successfulNonRuleSummary(existing)
-      ? cachedRecordToSummary(existing, "cache_non_rule")
-      : null;
-  if (stableNonRuleCached) {
-    return {
-      ...stableNonRuleCached,
-      contentHash,
-      model: existingModel,
-      promptVersion: existingPromptVersion,
-      fromCache: true,
-    };
-  }
-
   const cached =
     !forceSummaryRefresh &&
     existing &&
@@ -893,7 +891,7 @@ export function buildSessionMetadataForSync(
     existing.summary_model === settings.model &&
     Number(existing.summary_prompt_version ?? 0) === SUMMARY_PROMPT_VERSION &&
     canUseStrongCache(existing, settings.provider)
-      ? cachedRecordToSummary(existing, "cache_hit")
+      ? cachedRecordToSummary(existing)
       : null;
   if (cached) {
     return {
@@ -908,10 +906,10 @@ export function buildSessionMetadataForSync(
   const remoteExpired =
     !forceSummaryRefresh &&
     nonRuleProvider(settings.provider) &&
-    !isWithinRemoteSummaryAge(options.startTime ?? messages[0]?.ts ?? null);
+    !isWithinRemoteSummaryAge(options.endTime ?? existing?.end_time ?? messages[messages.length - 1]?.ts ?? null);
   const expiredExisting =
     existing && remoteExpired && existing.summary_content_hash === contentHash
-      ? cachedRecordToSummary(existing, "cache_remote_expired")
+      ? cachedRecordToSummary(existing)
       : null;
   if (expiredExisting) {
     return {
@@ -947,10 +945,20 @@ export function buildSessionMetadataForSync(
 
 export function shouldRefreshUnchangedSummary(existing: CachedSummaryRecord | undefined): boolean {
   if (!existing) return false;
-  const status = (existing.summary_status ?? "").toLowerCase();
+  const settings = getSummarySettings();
+  const status = stableSummaryStatus(existing).toLowerCase();
   const version = Number(existing.summary_prompt_version ?? 0);
-  if (version >= SUMMARY_PROMPT_VERSION) return false;
-  return providerFromCache(existing.summary_provider) === "rule" && status.startsWith("fallback_rule");
+  const cachedProvider = providerFromCache(existing.summary_provider);
+  const versionChanged = version !== SUMMARY_PROMPT_VERSION;
+  const modelChanged = existing.summary_model !== settings.model;
+  const providerChanged = !providerMatchesSettings(cachedProvider, settings.provider);
+  const failed = status.startsWith("fallback_rule") || status === "remote_summary_expired";
+
+  if (settings.provider === "rule") {
+    return versionChanged || providerChanged || failed;
+  }
+  if (!isWithinRemoteSummaryAge(existing.end_time)) return false;
+  return versionChanged || modelChanged || providerChanged || failed;
 }
 
 export function testCodexSummaryConnection(): { ok: boolean; detail: string } {
