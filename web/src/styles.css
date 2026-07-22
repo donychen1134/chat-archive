@@ -470,6 +470,12 @@ button:disabled {
   border-color: #f4b7ca;
 }
 
+.tool-catpaw {
+  color: #6b21a8;
+  background: #f5ecff;
+  border-color: #d9b8ff;
+}
+
 .summary-headline {
   margin-top: 8px;
   font-size: 12px;

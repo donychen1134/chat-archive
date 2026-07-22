@@ -3,6 +3,7 @@ import { countClaudeSessionFiles, syncClaudeSessions } from "./claude-ingest.js"
 import { countCopilotSessionFiles, syncCopilotSessions } from "./copilot-ingest.js";
 import { countGeminiSessionFiles, syncGeminiSessions } from "./gemini-ingest.js";
 import { countOpencodeSessionFiles, syncOpencodeSessions } from "./opencode-ingest.js";
+import { countCatpawSessionFiles, syncCatpawSessions } from "./catpaw-ingest.js";
 import type { SyncProgress, SyncStats } from "./types.js";
 
 export function estimateTotalSourceFiles(): number {
@@ -11,7 +12,8 @@ export function estimateTotalSourceFiles(): number {
     countClaudeSessionFiles() +
     countCopilotSessionFiles() +
     countGeminiSessionFiles() +
-    countOpencodeSessionFiles()
+    countOpencodeSessionFiles() +
+    countCatpawSessionFiles()
   );
 }
 
@@ -82,25 +84,76 @@ export function syncAll(onProgress?: (progress: SyncProgress) => void): SyncStat
       ].slice(-12),
     });
   });
+  const catpawStats = syncCatpawSessions((p) => {
+    if (!onProgress) return;
+    onProgress({
+      totalFiles,
+      processedFiles:
+        codexStats.scannedFiles +
+        claudeStats.scannedFiles +
+        copilotStats.scannedFiles +
+        geminiStats.scannedFiles +
+        opencodeStats.scannedFiles +
+        p.processedFiles,
+      updatedSessions:
+        codexStats.updatedSessions +
+        claudeStats.updatedSessions +
+        copilotStats.updatedSessions +
+        geminiStats.updatedSessions +
+        opencodeStats.updatedSessions +
+        p.updatedSessions,
+      skippedFiles:
+        codexStats.skippedFiles +
+        claudeStats.skippedFiles +
+        copilotStats.skippedFiles +
+        geminiStats.skippedFiles +
+        opencodeStats.skippedFiles +
+        p.skippedFiles,
+      warnings:
+        codexStats.warnings + claudeStats.warnings + copilotStats.warnings + geminiStats.warnings + opencodeStats.warnings + p.warnings,
+      currentFile: p.currentFile,
+      warningDetails: [
+        ...codexStats.warningDetails,
+        ...claudeStats.warningDetails,
+        ...copilotStats.warningDetails,
+        ...geminiStats.warningDetails,
+        ...opencodeStats.warningDetails,
+        ...p.warningDetails,
+      ].slice(-12),
+    });
+  });
 
   return {
     scannedFiles:
-      codexStats.scannedFiles + claudeStats.scannedFiles + copilotStats.scannedFiles + geminiStats.scannedFiles + opencodeStats.scannedFiles,
+      codexStats.scannedFiles +
+      claudeStats.scannedFiles +
+      copilotStats.scannedFiles +
+      geminiStats.scannedFiles +
+      opencodeStats.scannedFiles +
+      catpawStats.scannedFiles,
     updatedSessions:
       codexStats.updatedSessions +
       claudeStats.updatedSessions +
       copilotStats.updatedSessions +
       geminiStats.updatedSessions +
-      opencodeStats.updatedSessions,
+      opencodeStats.updatedSessions +
+      catpawStats.updatedSessions,
     skippedFiles:
-      codexStats.skippedFiles + claudeStats.skippedFiles + copilotStats.skippedFiles + geminiStats.skippedFiles + opencodeStats.skippedFiles,
-    warnings: codexStats.warnings + claudeStats.warnings + copilotStats.warnings + geminiStats.warnings + opencodeStats.warnings,
+      codexStats.skippedFiles +
+      claudeStats.skippedFiles +
+      copilotStats.skippedFiles +
+      geminiStats.skippedFiles +
+      opencodeStats.skippedFiles +
+      catpawStats.skippedFiles,
+    warnings:
+      codexStats.warnings + claudeStats.warnings + copilotStats.warnings + geminiStats.warnings + opencodeStats.warnings + catpawStats.warnings,
     warningDetails: [
       ...codexStats.warningDetails,
       ...claudeStats.warningDetails,
       ...copilotStats.warningDetails,
       ...geminiStats.warningDetails,
       ...opencodeStats.warningDetails,
+      ...catpawStats.warningDetails,
     ].slice(-20),
   };
 }

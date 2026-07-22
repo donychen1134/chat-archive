@@ -7,6 +7,7 @@ import { syncCodexSessions } from "./codex-ingest.js";
 import { syncCopilotSessions } from "./copilot-ingest.js";
 import { syncGeminiSessions } from "./gemini-ingest.js";
 import { syncOpencodeSessions } from "./opencode-ingest.js";
+import { syncCatpawSessions } from "./catpaw-ingest.js";
 import {
   getPurposeSettings,
   getSummarySettings,
@@ -52,7 +53,7 @@ await app.register(cors, { origin: true });
 
 type SessionRow = {
   id: string;
-  tool: "codex" | "claude" | "copilot" | "gemini" | "opencode" | string;
+  tool: "codex" | "claude" | "copilot" | "gemini" | "opencode" | "catpaw" | string;
   source_path: string;
   [key: string]: unknown;
 };
@@ -103,6 +104,7 @@ function extractNativeSessionId(tool: string, id: string, sourcePath: string): s
     return parts[parts.length - 1] ?? null;
   }
   if (tool === "opencode") return tail;
+  if (tool === "catpaw") return tail;
   return null;
 }
 
@@ -257,6 +259,10 @@ function buildResumeHint(
   if (tool === "opencode" && nativeSessionId) {
     return { command: `${projectPrefix}opencode --session ${nativeSessionId}`, label: "Resume" };
   }
+  // CatPaw IDE sessions live inside the IDE GUI; there is no CLI resume path.
+  if (tool === "catpaw") {
+    return { command: "", label: "" };
+  }
   return { command: "", label: "" };
 }
 
@@ -383,6 +389,9 @@ function inferSessionPurposeAndTarget(row: SessionRow, settings: PurposeSettings
     "state",
     "opencode",
     "opencode.db",
+    "catpaw",
+    "agent-transcripts",
+    "transcript",
   ]);
   const normalize = (value: string): string => value.replace(/\s+/g, " ").trim();
   const looksLikeUuid = (value: string): boolean =>
@@ -628,6 +637,8 @@ app.post("/api/reindex/session", async (request, reply) => {
             ? syncGeminiSessions(undefined, syncOptions)
             : row.tool === "opencode"
               ? syncOpencodeSessions(undefined, syncOptions)
+              : row.tool === "catpaw"
+                ? syncCatpawSessions(undefined, syncOptions)
             : null;
   if (!stats) {
     reply.code(400);
@@ -733,17 +744,18 @@ app.get("/api/sessions", async (request, reply) => {
     | "claude"
     | "copilot"
     | "gemini"
-    | "opencode";
+    | "opencode"
+    | "catpaw";
   const toolsRaw = (request.query as Record<string, string | undefined>).tools?.trim() ?? "";
   const fromTools = toolsRaw
     .split(",")
     .map((v) => v.trim())
     .filter(
-      (v): v is "codex" | "claude" | "copilot" | "gemini" | "opencode" =>
-        v === "codex" || v === "claude" || v === "copilot" || v === "gemini" || v === "opencode"
+      (v): v is "codex" | "claude" | "copilot" | "gemini" | "opencode" | "catpaw" =>
+        v === "codex" || v === "claude" || v === "copilot" || v === "gemini" || v === "opencode" || v === "catpaw"
     );
   const legacyTool =
-    tool === "codex" || tool === "claude" || tool === "copilot" || tool === "gemini" || tool === "opencode" ? [tool] : [];
+    tool === "codex" || tool === "claude" || tool === "copilot" || tool === "gemini" || tool === "opencode" || tool === "catpaw" ? [tool] : [];
   const toolFilters = Array.from(new Set([...(fromTools.length > 0 ? fromTools : legacyTool)]));
   const page = parseBoundedPositiveInt((request.query as Record<string, string | undefined>).page, 1, 1_000_000);
   const pageSize = parseBoundedPositiveInt((request.query as Record<string, string | undefined>).pageSize, 20, 100);

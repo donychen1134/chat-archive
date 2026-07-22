@@ -17,6 +17,7 @@ CLI chat logs often contain high-value troubleshooting context and design decisi
 - Claude Code (`~/.claude/projects/**/*.jsonl`, excluding `subagents`)
 - Copilot CLI (`~/.copilot/session-state/**/events.jsonl`)
 - Gemini CLI (`~/.gemini/tmp/**/chats/session-*.json`)
+- CatPaw IDE (`~/.catpaw/projects/*/*/agent-transcripts/transcript.txt`)
 
 All data is stored locally in SQLite.
 
@@ -104,6 +105,7 @@ curl -X POST http://127.0.0.1:8765/api/summary/test
 - `CLAUDE_PROJECTS_DIR`
 - `COPILOT_SESSIONS_DIR`
 - `GEMINI_SESSIONS_DIR`
+- `CATPAW_PROJECTS_DIR`
 - `CHAT_ARCHIVE_HOME` (default: `~/.chat-archive`)
 - `PORT` (default: `8765`)
 - `AUTO_SYNC_ON_START=false`

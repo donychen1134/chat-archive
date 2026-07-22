@@ -5,10 +5,10 @@ import { oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 
 type Scope = "all" | "question" | "answer";
 type Role = "user" | "assistant" | "tool" | "system";
-type ToolFilter = "codex" | "claude" | "copilot" | "gemini" | "opencode";
+type ToolFilter = "codex" | "claude" | "copilot" | "gemini" | "opencode" | "catpaw";
 type ViewMode = "archive" | "usage";
 type SessionSortBy = "start_time" | "end_time";
-const ALL_TOOLS: ToolFilter[] = ["codex", "claude", "copilot", "gemini", "opencode"];
+const ALL_TOOLS: ToolFilter[] = ["codex", "claude", "copilot", "gemini", "opencode", "catpaw"];
 
 interface Session {
   id: string;
@@ -1157,6 +1157,12 @@ export function App() {
             >
               OpenCode
             </button>
+            <button
+              className={`tool-chip ${selectedTools.includes("catpaw") ? "active" : ""}`}
+              onClick={(e) => toggleTool("catpaw", e.metaKey || e.ctrlKey || e.shiftKey)}
+            >
+              CatPaw
+            </button>
           </div>
           <div className="tool-filter-tip">单击单选，按 Cmd/Ctrl/Shift 可多选</div>
         </div>
@@ -1229,6 +1235,8 @@ export function App() {
                             ? "Gemini"
                             : session.tool === "opencode"
                               ? "OpenCode"
+                              : session.tool === "catpaw"
+                                ? "CatPaw IDE"
                             : session.tool}
                   </span>
                   <span className="meta-side">
@@ -1323,7 +1331,7 @@ export function App() {
                   <div className="usage-breakdown-list">
                     {(usageOverview?.byTool ?? []).map((item) => (
                       <div key={item.tool} className="usage-breakdown-row">
-                        <span className={`tool-badge tool-${item.tool}`}>{item.tool === "claude" ? "Claude Code" : item.tool === "opencode" ? "OpenCode" : item.tool}</span>
+                        <span className={`tool-badge tool-${item.tool}`}>{item.tool === "claude" ? "Claude Code" : item.tool === "opencode" ? "OpenCode" : item.tool === "catpaw" ? "CatPaw IDE" : item.tool}</span>
                         <strong>{formatNumber(item.total_tokens)}</strong>
                         <span>{item.sessions} 会话</span>
                       </div>
@@ -1341,7 +1349,7 @@ export function App() {
                   {usageSessions.map((item) => (
                     <button key={item.id} className="usage-session-row" onClick={() => { setViewMode("archive"); setSelected(item.id); }}>
                       <span className="usage-session-title">{item.title}</span>
-                      <span className={`tool-badge tool-${item.tool}`}>{item.tool === "claude" ? "Claude Code" : item.tool === "opencode" ? "OpenCode" : item.tool}</span>
+                      <span className={`tool-badge tool-${item.tool}`}>{item.tool === "claude" ? "Claude Code" : item.tool === "opencode" ? "OpenCode" : item.tool === "catpaw" ? "CatPaw IDE" : item.tool}</span>
                       <span>{formatNumber(item.usage_total_tokens)}</span>
                       <span className={`usage-status usage-${item.usage_status ?? "unavailable"}`}>{item.usage_status ?? "unavailable"}</span>
                     </button>
@@ -1368,6 +1376,8 @@ export function App() {
                               ? "Gemini"
                               : selectedSession.tool === "opencode"
                                 ? "OpenCode"
+                                : selectedSession.tool === "catpaw"
+                                  ? "CatPaw IDE"
                               : selectedSession.tool}
                     </span>
                     <span className="meta-time">开始时间：{formatTime(selectedSession.start_time)}</span>
