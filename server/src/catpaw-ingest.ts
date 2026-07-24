@@ -51,27 +51,80 @@ export function countCatpawSessionFiles(): number {
 }
 
 // Slug form: "ide-Users-mt-go-src-git-sankuai-com-data-data-virtual-kubelet"
-// or "Users-mt-Desktop-catpaw-desk". The IDE replaces path separators and "."
-// with "-". Best-effort restore to a readable path; not lossless.
-function projectFromSlug(slug: string): string | null {
-  let body = slug;
-  const idePrefix = "ide-";
-  if (body.startsWith(idePrefix)) body = body.slice(idePrefix.length);
-  const segments = body.split("-").filter(Boolean);
-  if (segments.length === 0) return null;
+// or "Users-mt-Desktop-catpaw-desk". The IDE encodes the absolute cwd by
+// replacing both "/" and "." with "-", so a repo named "data-virtual-kubelet"
+// becomes "data-virtual-kubelet" in the slug — indistinguishable from three
+// separate path segments "data/virtual/kubelet" by string inspection alone.
+//
+// We resolve the ambiguity by probing the real filesystem: the encoded cwd
+// (almost always) still exists on disk, so we walk from "/" and greedily
+// consume the longest run of tokens whose joined name matches an existing
+// directory (trying both "-" and "." joiners, the latter for host dots like
+// "git.sankuai.com"). This keeps hyphenated repo names intact. When the path
+// no longer exists, we fall back to the older git.sankuai.com heuristic.
+const slugPathCache = new Map<string, string | null>();
 
-  // Recognise a "git-sankuai-com-<rest>" segment run anywhere in the slug and
-  // restore it as "git.sankuai.com/<rest>", collapsing the host dots. Anything
-  // before it (e.g. "Users/mt/go/src") is dropped since the repo path is the
-  // meaningful project identity. A repo/group name that legitimately contains
-  // "-" cannot be distinguished from a path boundary, but this restores the
-  // common case usefully.
+function directoryExists(full: string): boolean {
+  try {
+    return fs.statSync(full).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function restorePathByProbe(tokens: string[]): string | null {
+  if (tokens.length === 0) return null;
+  let current = "";
+  let i = 0;
+  while (i < tokens.length) {
+    const maxK = Math.min(tokens.length - i, 12);
+    let matched: { path: string; consumed: number } | null = null;
+    for (let k = maxK; k >= 1; k -= 1) {
+      const joined = tokens.slice(i, i + k).join("-");
+      const candidates = joined.includes(".") ? [joined] : [joined, joined.replace(/-/g, ".")];
+      for (const name of candidates) {
+        const full = current ? `${current}/${name}` : `/${name}`;
+        if (directoryExists(full)) {
+          matched = { path: full, consumed: k };
+          break;
+        }
+      }
+      if (matched) break;
+    }
+    if (!matched) return null; // can't disambiguate further; caller falls back
+    current = matched.path;
+    i += matched.consumed;
+  }
+  return current || null;
+}
+
+function fallbackPathFromSegments(segments: string[]): string | null {
+  if (segments.length === 0) return null;
   const gitIdx = segments.indexOf("git");
-  if (gitIdx >= 0 && gitIdx + 2 < segments.length && segments[gitIdx + 1] === "sankuai" && segments[gitIdx + 2] === "com") {
+  if (
+    gitIdx >= 0 &&
+    gitIdx + 2 < segments.length &&
+    segments[gitIdx + 1] === "sankuai" &&
+    segments[gitIdx + 2] === "com"
+  ) {
     const rest = segments.slice(gitIdx + 3);
     return rest.length > 0 ? `git.sankuai.com/${rest.join("/")}` : "git.sankuai.com";
   }
   return segments.join("/");
+}
+
+function projectFromSlug(slug: string): string | null {
+  const cached = slugPathCache.get(slug);
+  if (cached !== undefined) return cached;
+  let body = slug;
+  const idePrefix = "ide-";
+  if (body.startsWith(idePrefix)) body = body.slice(idePrefix.length);
+  const segments = body.split("-").filter(Boolean);
+
+  const probed = restorePathByProbe(segments);
+  const result = probed ?? fallbackPathFromSegments(segments);
+  slugPathCache.set(slug, result);
+  return result;
 }
 
 function extractToolSummary(lines: string[], start: number, toolName: string): { content: string; next: number } {
