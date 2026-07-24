@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { realProjectName } from "./session-target.js";
 
 const baseDir = process.env.CHAT_ARCHIVE_HOME ?? path.join(os.homedir(), ".chat-archive");
 fs.mkdirSync(baseDir, { recursive: true });
@@ -209,6 +210,30 @@ if (pollutedStatuses.length > 0) {
     }
   );
   cleanStatuses(pollutedStatuses);
+}
+
+// Backfill: when a session maps to a real project repo, the target ("对象")
+// should be the project name rather than whatever the summarizer guessed. This
+// is idempotent — after the first run every row already holds the project name,
+// so subsequent boots skip the UPDATE. New/changed sessions are corrected at
+// ingest time, this only fixes pre-existing rows in place.
+const targetBackfillRows = db
+  .prepare("SELECT id, project, session_target FROM sessions WHERE project IS NOT NULL AND project <> ''")
+  .all() as Array<{ id: string; project: string; session_target: string }>;
+const targetBackfillCandidates = targetBackfillRows
+  .map((row) => ({ id: row.id, target: realProjectName(row.project), current: (row.session_target ?? "").trim() }))
+  .filter((row) => row.target && row.target !== row.current);
+if (targetBackfillCandidates.length > 0) {
+  const updateTarget = db.prepare("UPDATE sessions SET session_target = ?, updated_at = ? WHERE id = ?");
+  const backfillTargets = db.transaction(
+    (rows: Array<{ id: string; target: string; current: string }>) => {
+      const now = nowIso();
+      for (const row of rows) {
+        updateTarget.run(row.target, now, row.id);
+      }
+    }
+  );
+  backfillTargets(targetBackfillCandidates);
 }
 
 export function nowIso(): string {

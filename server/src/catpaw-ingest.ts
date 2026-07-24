@@ -4,6 +4,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { db, nowIso } from "./db.js";
 import { buildSessionMetadataForSync, shouldRefreshUnchangedSummary, type CachedSummaryRecord } from "./summary-provider.js";
+import { resolveSessionTarget } from "./session-target.js";
 import { getSummarySettings } from "./settings.js";
 import type { ChatRole, MessageRecord, SyncProgress, SyncStats } from "./types.js";
 
@@ -334,6 +335,9 @@ export function syncCatpawSessions(
     deleteFts.run(sessionId);
     deleteMessages.run(sessionId);
     deleteSession.run(sessionId);
+
+    // When the session maps to a real project, the project name is the target.
+    metadata.target = resolveSessionTarget(parsed.project, metadata.target);
 
     insertSession.run(
       sessionId,

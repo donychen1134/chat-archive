@@ -29,6 +29,11 @@ import {
   quoteFtsToken,
   tokenizeSearchInput,
 } from "./search-utils.js";
+import {
+  isNoiseToken,
+  looksLikeId,
+  resolveSessionTarget,
+} from "./session-target.js";
 
 const app = Fastify({ logger: false });
 const port = Number(process.env.PORT ?? 8765);
@@ -178,30 +183,22 @@ function metadataLikeClause(alias: string): string {
   return SEARCH_META_COLUMNS.map((column) => `COALESCE(${alias}.${column},'') LIKE ? ESCAPE '\\'`).join(" OR ");
 }
 
-function buildAllScopeSessionMatch(tokens: string[]): { sql: string; params: string[] } {
+function buildSessionMatch(
+  tokens: string[],
+  role: "user" | "assistant" | undefined
+): { sql: string; params: string[] } {
   const params: string[] = [];
+  const roleClause = role ? `role = '${role}' AND ` : "";
   const tokenSets = tokens.map((token) => {
     const like = escapeLikeToken(token);
     params.push(quoteFtsToken(token), ...SEARCH_META_COLUMNS.map(() => like));
     return `SELECT id FROM (
-      SELECT session_id AS id FROM message_fts WHERE content MATCH ?
+      SELECT session_id AS id FROM message_fts WHERE ${roleClause}content MATCH ?
       UNION
       SELECT s.id FROM sessions s WHERE (${metadataLikeClause("s")})
     )`;
   });
   return { sql: tokenSets.length > 0 ? tokenSets.join(" INTERSECT ") : "SELECT NULL AS id WHERE 0", params };
-}
-
-function buildScopedSessionMatch(
-  tokens: string[],
-  role: "user" | "assistant",
-): { sql: string; params: string[] } {
-  return {
-    sql: tokens
-      .map(() => `SELECT session_id AS id FROM message_fts WHERE role = '${role}' AND content MATCH ?`)
-      .join(" INTERSECT "),
-    params: tokens.map(quoteFtsToken),
-  };
 }
 
 function metadataAnyMatch(tokens: string[], alias = "s"): { sql: string; params: string[] } {
@@ -368,53 +365,8 @@ function inferSessionPurposeAndTarget(row: SessionRow, settings: PurposeSettings
       .map((v) => v.trim().toLowerCase())
       .filter(Boolean)
   );
-  const builtinNoise = new Set([
-    "users",
-    "user",
-    "home",
-    "src",
-    "tmp",
-    "sessions",
-    "session",
-    "events",
-    "projects",
-    "project",
-    "workspace",
-    "workspaces",
-    "repos",
-    "repo",
-    "chat-archive",
-    "share",
-    "local",
-    "state",
-    "opencode",
-    "opencode.db",
-    "catpaw",
-    "agent-transcripts",
-    "transcript",
-  ]);
   const normalize = (value: string): string => value.replace(/\s+/g, " ").trim();
-  const looksLikeUuid = (value: string): boolean =>
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
-  const looksLikeHash = (value: string): boolean =>
-    /^[0-9a-f]{16,}$/i.test(value) ||
-    /^([0-9a-f]{4,}[-_]){2,}[0-9a-f]{4,}$/i.test(value) ||
-    (/^[a-z0-9_-]{20,}$/i.test(value) && !/[aeiou]/i.test(value));
-  const looksLikeId = (value: string): boolean => looksLikeUuid(value) || looksLikeHash(value);
-  const isNoise = (value: string): boolean => {
-    const v = normalize(value).toLowerCase();
-    if (!v || v.length < 2) return true;
-    if (noiseWords.has(v)) return true;
-    if (builtinNoise.has(v)) return true;
-    if (looksLikeId(v)) return true;
-    if (/^[a-z]{1,3}$/i.test(v)) return true;
-    if (/^\d+$/.test(v)) return true;
-    if (v.includes("#session:")) return true;
-    if (v.endsWith(".db")) return true;
-    if (v.includes(".db#")) return true;
-    if (v.startsWith(".") && !v.includes("-") && !v.includes("_")) return true;
-    return false;
-  };
+  const isNoise = (value: string): boolean => isNoiseToken(value, noiseWords);
 
   const extractModuleToken = (text: string): string => {
     const matches = text.match(/[a-z0-9]+(?:[-_][a-z0-9]+){1,}/gi) ?? [];
@@ -572,7 +524,10 @@ function withResumeHint(row: SessionRow, purposeSettings: PurposeSettings): Sess
   const inferred = inferSessionPurposeAndTarget(row, purposeSettings);
   const savedPurpose = typeof row.session_purpose === "string" ? row.session_purpose.trim() : "";
   const savedTarget = typeof row.session_target === "string" ? row.session_target.trim() : "";
-  const effectiveTarget = !savedTarget || savedTarget === "会话目标" ? inferred.session_target : savedTarget;
+  // When the session maps to a real project, the project name is the target;
+  // otherwise prefer the saved (summarizer) target, falling back to inference
+  // when nothing usable was stored.
+  const effectiveTarget = resolveSessionTarget(project, savedTarget) || inferred.session_target;
   const effectivePurpose = savedPurpose || inferred.session_purpose;
   const displayTitle = sanitizeDisplayTitle(String(row.title ?? ""), effectiveTarget, effectivePurpose, String(row.summary ?? ""));
   return {
@@ -653,9 +608,11 @@ app.post("/api/reindex/session", async (request, reply) => {
   const latestTarget = typeof latest?.session_target === "string" ? latest.session_target.trim() : "";
   if (latest && (!latestPurpose || !latestTarget || latestTarget === "会话目标")) {
     const inferred = inferSessionPurposeAndTarget(latest, getPurposeSettings());
+    const latestProject = typeof latest.project === "string" ? latest.project : null;
+    const resolvedTarget = resolveSessionTarget(latestProject, latestTarget) || inferred.session_target;
     db.prepare("UPDATE sessions SET session_purpose = ?, session_target = ?, updated_at = ? WHERE id = ?").run(
       latestPurpose || inferred.session_purpose,
-      latestTarget && latestTarget !== "会话目标" ? latestTarget : inferred.session_target,
+      resolvedTarget,
       new Date().toISOString(),
       latest.id
     );
@@ -795,27 +752,21 @@ app.get("/api/sessions", async (request, reply) => {
     return { error: `搜索关键词不能超过 ${MAX_SEARCH_TOKENS} 个。` };
   }
 
-  const roleFilter = scope === "question" ? "AND f.role = 'user'" : scope === "answer" ? "AND f.role = 'assistant'" : "";
-  const allSessionMatch = buildAllScopeSessionMatch(tokens);
+  const role = scope === "question" ? "user" : scope === "answer" ? "assistant" : undefined;
+  const roleFilter = role ? `AND f.role = '${role}'` : "";
+  const sessionMatch = buildSessionMatch(tokens, role);
   const metaAnyMatch = metadataAnyMatch(tokens);
-  const scopedSessionMatch =
-    scope === "question"
-      ? buildScopedSessionMatch(tokens, "user")
-      : scope === "answer"
-        ? buildScopedSessionMatch(tokens, "assistant")
-        : null;
 
   let rows: SessionRow[] = [];
   let total: { c: number } = { c: 0 };
   try {
-    if (scope === "all") {
-      rows = (await withDbRetry(() =>
+    rows = (await withDbRetry(() =>
         db
           .prepare(
             `
       WITH eligible AS (
         SELECT token_match.id
-        FROM (${allSessionMatch.sql}) token_match
+        FROM (${sessionMatch.sql}) token_match
         JOIN sessions s ON s.id = token_match.id
         WHERE 1=1 ${toolClause}
       ),
@@ -865,7 +816,7 @@ app.get("/api/sessions", async (request, reply) => {
         JOIN eligible e ON e.id = s.id
         LEFT JOIN session_usage_summary u ON u.session_id = s.id
         JOIN message_fts f ON f.session_id = s.id
-        WHERE f.content MATCH ?
+        WHERE f.content MATCH ? ${roleFilter}
         UNION ALL
         SELECT
           s.id AS session_id,
@@ -1008,7 +959,7 @@ app.get("/api/sessions", async (request, reply) => {
     `
           )
           .all(
-            ...allSessionMatch.params,
+            ...sessionMatch.params,
             ...toolFilters,
             ftsQuery,
             ...metaAnyMatch.params,
@@ -1023,7 +974,7 @@ app.get("/api/sessions", async (request, reply) => {
             `
       WITH eligible AS (
         SELECT token_match.id
-        FROM (${allSessionMatch.sql}) token_match
+        FROM (${sessionMatch.sql}) token_match
         JOIN sessions s ON s.id = token_match.id
         WHERE 1=1 ${toolClause}
       )
@@ -1031,175 +982,10 @@ app.get("/api/sessions", async (request, reply) => {
     `
           )
           .get(
-            ...allSessionMatch.params,
+            ...sessionMatch.params,
             ...toolFilters
           )
       )) as { c: number };
-    } else {
-      if (!scopedSessionMatch) {
-        reply.status(400);
-        return { error: "搜索范围不合法。" };
-      }
-      const queryParams = [...scopedSessionMatch.params, ...toolFilters, ftsQuery, pageSize, offset];
-      const totalParams = [...scopedSessionMatch.params, ...toolFilters];
-      rows = (await withDbRetry(() =>
-        db
-          .prepare(
-            `
-      WITH eligible AS (
-        SELECT token_match.id
-        FROM (${scopedSessionMatch.sql}) token_match
-        JOIN sessions s ON s.id = token_match.id
-        WHERE 1=1 ${toolClause}
-      ),
-      matched AS (
-        SELECT
-          s.id AS session_id,
-          s.tool,
-          s.source_path,
-          s.project,
-          s.start_time,
-          s.end_time,
-          s.duration_sec,
-          s.title,
-          s.summary,
-          s.summary_provider,
-          s.summary_status,
-          s.session_purpose,
-          s.session_target,
-          s.session_outcome,
-          s.keywords_json,
-          s.entities_json,
-          s.metadata_version,
-          s.message_count,
-          u.usage_status,
-          u.provider AS usage_provider,
-          u.model AS usage_model,
-          u.input_tokens AS usage_input_tokens,
-          u.output_tokens AS usage_output_tokens,
-          u.reasoning_tokens AS usage_reasoning_tokens,
-          u.cache_read_tokens AS usage_cache_read_tokens,
-          u.cache_write_tokens AS usage_cache_write_tokens,
-          u.tool_tokens AS usage_tool_tokens,
-          u.total_tokens AS usage_total_tokens,
-          u.cost AS usage_cost,
-          u.record_count AS usage_record_count,
-          u.last_usage_time,
-          (
-            SELECT COUNT(*)
-            FROM messages m
-            WHERE m.session_id = s.id AND m.role = 'user'
-          ) AS question_count,
-          s.created_at,
-          s.updated_at,
-          f.role AS hit_role,
-          f.content AS hit_excerpt
-        FROM sessions s
-        JOIN eligible e ON e.id = s.id
-        LEFT JOIN session_usage_summary u ON u.session_id = s.id
-        JOIN message_fts f ON f.session_id = s.id
-        WHERE f.content MATCH ? ${roleFilter}
-      )
-      SELECT
-        session_id AS id,
-        tool,
-        source_path,
-        project,
-        start_time,
-        end_time,
-        duration_sec,
-        title,
-        summary,
-        summary_provider,
-        summary_status,
-        session_purpose,
-        session_target,
-        session_outcome,
-        keywords_json,
-        entities_json,
-        metadata_version,
-        message_count,
-        usage_status,
-        usage_provider,
-        usage_model,
-        usage_input_tokens,
-        usage_output_tokens,
-        usage_reasoning_tokens,
-        usage_cache_read_tokens,
-        usage_cache_write_tokens,
-        usage_tool_tokens,
-        usage_total_tokens,
-        usage_cost,
-        usage_record_count,
-        last_usage_time,
-        question_count,
-        created_at,
-        updated_at,
-        0.0 AS hit_score,
-        GROUP_CONCAT(DISTINCT hit_role) AS hit_roles,
-        COALESCE(
-          MAX(CASE WHEN hit_role = 'user' THEN hit_excerpt END),
-          MAX(hit_excerpt)
-        ) AS hit_excerpt
-      FROM matched
-      GROUP BY
-        session_id,
-        tool,
-        source_path,
-        project,
-        start_time,
-        end_time,
-        duration_sec,
-        title,
-        summary,
-        summary_provider,
-        summary_status,
-        session_purpose,
-        session_target,
-        session_outcome,
-        keywords_json,
-        entities_json,
-        metadata_version,
-        message_count,
-        usage_status,
-        usage_provider,
-        usage_model,
-        usage_input_tokens,
-        usage_output_tokens,
-        usage_reasoning_tokens,
-        usage_cache_read_tokens,
-        usage_cache_write_tokens,
-        usage_tool_tokens,
-        usage_total_tokens,
-        usage_cost,
-        usage_record_count,
-        last_usage_time,
-        question_count,
-        created_at,
-        updated_at
-      ORDER BY ${resultOrder}
-      LIMIT ? OFFSET ?
-    `
-          )
-          .all(...queryParams)
-      )) as SessionRow[];
-
-      total = (await withDbRetry(() =>
-        db
-          .prepare(
-            `
-      WITH eligible AS (
-        SELECT token_match.id
-        FROM (${scopedSessionMatch.sql}) token_match
-        JOIN sessions s ON s.id = token_match.id
-        WHERE 1=1 ${toolClause}
-      )
-      SELECT COUNT(*) as c FROM eligible
-    `
-          )
-          .get(...totalParams)
-      )) as { c: number };
-    }
   } catch (error) {
     if (isFtsQuerySyntaxError(error)) {
       reply.status(400);
