@@ -387,6 +387,12 @@ function normalizeQwenModel(input: string): string {
   return m;
 }
 
+export function summaryTemperatureOptions(model: string): { temperature?: number } {
+  // GPT 5.6 models only accept the platform default temperature.
+  if (/^gpt-5\.6(?:-|$)/i.test(model.trim())) return {};
+  return { temperature: 0.2 };
+}
+
 function logSummary(provider: string, model: string, ok: boolean, promptChars: number, usage: Record<string, number> | null, error?: string): void {
   const ts = new Date().toISOString();
   if (ok && usage) {
@@ -582,7 +588,7 @@ function buildFridaySummary(
 
   const reqBody = JSON.stringify({
     model: normalizedModel,
-    temperature: 0.2,
+    ...summaryTemperatureOptions(normalizedModel),
     stream: false,
     messages: [
       { role: "system", content: "你只输出严格 JSON，且内容使用简体中文。" },

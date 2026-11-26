@@ -8,6 +8,7 @@ import { syncCopilotSessions } from "./copilot-ingest.js";
 import { syncGeminiSessions } from "./gemini-ingest.js";
 import { syncOpencodeSessions } from "./opencode-ingest.js";
 import { syncCatpawSessions } from "./catpaw-ingest.js";
+import { syncT3Sessions } from "./t3-ingest.js";
 import {
   getPurposeSettings,
   getSummarySettings,
@@ -56,9 +57,17 @@ const DB_RETRY_DELAY_MS = Math.max(10, Number(process.env.DB_RETRY_DELAY_MS ?? "
 
 await app.register(cors, { origin: true });
 
+const SUPPORTED_TOOLS = ["codex", "claude", "copilot", "gemini", "opencode", "catpaw", "t3"] as const;
+type SupportedTool = (typeof SUPPORTED_TOOLS)[number];
+const SUPPORTED_TOOL_SET = new Set<string>(SUPPORTED_TOOLS);
+
+function isSupportedTool(value: string): value is SupportedTool {
+  return SUPPORTED_TOOL_SET.has(value);
+}
+
 type SessionRow = {
   id: string;
-  tool: "codex" | "claude" | "copilot" | "gemini" | "opencode" | "catpaw" | string;
+  tool: SupportedTool | string;
   source_path: string;
   [key: string]: unknown;
 };
@@ -110,6 +119,7 @@ function extractNativeSessionId(tool: string, id: string, sourcePath: string): s
   }
   if (tool === "opencode") return tail;
   if (tool === "catpaw") return tail;
+  if (tool === "t3") return tail;
   return null;
 }
 
@@ -255,6 +265,9 @@ function buildResumeHint(
   }
   if (tool === "opencode" && nativeSessionId) {
     return { command: `${projectPrefix}opencode --session ${nativeSessionId}`, label: "Resume" };
+  }
+  if (tool === "t3" && nativeSessionId) {
+    return { command: `t3 thread show ${nativeSessionId}`, label: "Show thread" };
   }
   // CatPaw IDE sessions live inside the IDE GUI; there is no CLI resume path.
   if (tool === "catpaw") {
@@ -594,6 +607,8 @@ app.post("/api/reindex/session", async (request, reply) => {
               ? syncOpencodeSessions(undefined, syncOptions)
               : row.tool === "catpaw"
                 ? syncCatpawSessions(undefined, syncOptions)
+                : row.tool === "t3"
+                  ? syncT3Sessions(undefined, syncOptions)
             : null;
   if (!stats) {
     reply.code(400);
@@ -663,7 +678,7 @@ app.post("/api/purpose/settings", async (request) => {
 app.post("/api/purpose/reclassify", async () => {
   const settings = getPurposeSettings();
   const rows = db
-    .prepare("SELECT id, tool, source_path, title, summary, project, session_purpose, session_target FROM sessions")
+    .prepare("SELECT id, tool, source_path, title, summary, project, session_purpose, session_target FROM sessions WHERE archive_visible = 1")
     .all() as SessionRow[];
   const update = db.prepare(
     "UPDATE sessions SET session_purpose = ?, session_target = ?, updated_at = ? WHERE id = ?"
@@ -695,24 +710,13 @@ app.get("/api/sessions", async (request, reply) => {
     return { error: "scope 仅支持 all、question 或 answer。" };
   }
   const scope = rawScope === "question" || rawScope === "answer" ? rawScope : "all";
-  const tool = ((request.query as Record<string, string | undefined>).tool ?? "all") as
-    | "all"
-    | "codex"
-    | "claude"
-    | "copilot"
-    | "gemini"
-    | "opencode"
-    | "catpaw";
+  const tool = ((request.query as Record<string, string | undefined>).tool ?? "all").trim();
   const toolsRaw = (request.query as Record<string, string | undefined>).tools?.trim() ?? "";
   const fromTools = toolsRaw
     .split(",")
     .map((v) => v.trim())
-    .filter(
-      (v): v is "codex" | "claude" | "copilot" | "gemini" | "opencode" | "catpaw" =>
-        v === "codex" || v === "claude" || v === "copilot" || v === "gemini" || v === "opencode" || v === "catpaw"
-    );
-  const legacyTool =
-    tool === "codex" || tool === "claude" || tool === "copilot" || tool === "gemini" || tool === "opencode" || tool === "catpaw" ? [tool] : [];
+    .filter(isSupportedTool);
+  const legacyTool = isSupportedTool(tool) ? [tool] : [];
   const toolFilters = Array.from(new Set([...(fromTools.length > 0 ? fromTools : legacyTool)]));
   const page = parseBoundedPositiveInt((request.query as Record<string, string | undefined>).page, 1, 1_000_000);
   const pageSize = parseBoundedPositiveInt((request.query as Record<string, string | undefined>).pageSize, 20, 100);
@@ -731,14 +735,14 @@ app.get("/api/sessions", async (request, reply) => {
           `SELECT ${SESSION_SELECT_COLUMNS}
            FROM sessions s
            LEFT JOIN session_usage_summary u ON u.session_id = s.id
-           WHERE 1=1 ${toolClause}
+           WHERE s.archive_visible = 1 ${toolClause}
            ORDER BY ${sessionOrder} LIMIT ? OFFSET ?`
         )
         .all(...toolFilters, pageSize, offset)
     )) as SessionRow[];
     const total = (await withDbRetry(() =>
       db
-        .prepare(`SELECT COUNT(*) as c FROM sessions s WHERE 1=1 ${toolClause}`)
+        .prepare(`SELECT COUNT(*) as c FROM sessions s WHERE s.archive_visible = 1 ${toolClause}`)
         .get(...toolFilters)
     )) as { c: number };
     return { items: rows.map((row) => withResumeHint(row, purposeSettings)), total: total.c };
@@ -768,7 +772,7 @@ app.get("/api/sessions", async (request, reply) => {
         SELECT token_match.id
         FROM (${sessionMatch.sql}) token_match
         JOIN sessions s ON s.id = token_match.id
-        WHERE 1=1 ${toolClause}
+        WHERE s.archive_visible = 1 ${toolClause}
       ),
       matched AS (
         SELECT
@@ -976,7 +980,7 @@ app.get("/api/sessions", async (request, reply) => {
         SELECT token_match.id
         FROM (${sessionMatch.sql}) token_match
         JOIN sessions s ON s.id = token_match.id
-        WHERE 1=1 ${toolClause}
+        WHERE s.archive_visible = 1 ${toolClause}
       )
       SELECT COUNT(*) as c FROM eligible
     `
@@ -1050,6 +1054,24 @@ app.get("/api/usage/overview", async (request) => {
       )
       .all(...toolFilters)
   )) as Array<Record<string, unknown>>;
+  const sessionKindToolClause =
+    toolFilters.length === 0 ? "" : `AND u.tool IN (${new Array(toolFilters.length).fill("?").join(",")})`;
+  const bySessionKind = (await withDbRetry(() =>
+    db
+      .prepare(
+        `SELECT
+          COALESCE(s.session_kind, 'user') AS session_kind,
+          COUNT(*) AS sessions,
+          SUM(u.total_tokens) AS total_tokens,
+          SUM(u.cost) AS cost
+         FROM session_usage_summary u
+         JOIN sessions s ON s.id = u.session_id
+         WHERE 1=1 ${sessionKindToolClause}
+         GROUP BY COALESCE(s.session_kind, 'user')
+         ORDER BY SUM(u.total_tokens) DESC`
+      )
+      .all(...toolFilters)
+  )) as Array<Record<string, unknown>>;
   const recentRaw = (await withDbRetry(() =>
     db
       .prepare(
@@ -1079,6 +1101,7 @@ app.get("/api/usage/overview", async (request) => {
     totals,
     recent,
     byTool,
+    bySessionKind,
     coverage: {
       totalSessions: Number(coverage.total_sessions ?? 0),
       coveredSessions: Number(coverage.covered_sessions ?? 0),
@@ -1151,7 +1174,7 @@ app.get("/api/usage/sessions", async (request) => {
     .map((value) => value.trim())
     .filter(Boolean);
   const toolClause =
-    toolFilters.length === 0 ? "" : `WHERE s.tool IN (${new Array(toolFilters.length).fill("?").join(",")})`;
+    toolFilters.length === 0 ? "" : `AND s.tool IN (${new Array(toolFilters.length).fill("?").join(",")})`;
   const orderClause =
     sortBy === "start_time" ? "datetime(s.start_time) DESC" : sortBy === "cost" ? "COALESCE(u.cost, 0) DESC" : "COALESCE(u.total_tokens, 0) DESC";
   const rows = (await withDbRetry(() =>
@@ -1160,7 +1183,7 @@ app.get("/api/usage/sessions", async (request) => {
         `SELECT ${SESSION_SELECT_COLUMNS}
          FROM sessions s
          LEFT JOIN session_usage_summary u ON u.session_id = s.id
-         ${toolClause}
+         WHERE s.archive_visible = 1 ${toolClause}
          ORDER BY ${orderClause}, datetime(s.start_time) DESC
          LIMIT ? OFFSET ?`
       )
@@ -1168,7 +1191,7 @@ app.get("/api/usage/sessions", async (request) => {
   )) as SessionRow[];
   const total = (await withDbRetry(() =>
     db
-      .prepare(`SELECT COUNT(*) AS c FROM sessions s ${toolClause}`)
+      .prepare(`SELECT COUNT(*) AS c FROM sessions s WHERE s.archive_visible = 1 ${toolClause}`)
       .get(...toolFilters)
   )) as { c: number };
   return { ok: true, items: rows.map((row) => withResumeHint(row, getPurposeSettings())), total: total.c };

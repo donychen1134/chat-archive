@@ -3,11 +3,56 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { db, nowIso } from "./db.js";
-import { buildSessionMetadataForSync, shouldRefreshUnchangedSummary, type CachedSummaryRecord } from "./summary-provider.js";
+import {
+  buildSessionMetadataForSync,
+  shouldRefreshUnchangedSummary,
+  type CachedSummaryRecord,
+  type SyncSummaryResult,
+} from "./summary-provider.js";
 import { resolveSessionTarget } from "./session-target.js";
 import { getSummarySettings } from "./settings.js";
-import type { ChatRole, MessageRecord, SyncProgress, SyncStats, UsageInput } from "./types.js";
+import { cleanMessageContentForArchive } from "./message-cleaning.js";
+import type { ChatRole, MessageRecord, SessionKind, SyncProgress, SyncStats, UsageInput } from "./types.js";
 import { replaceSessionUsage } from "./usage.js";
+
+const CODEX_METADATA_VERSION = 3;
+
+export type CodexSessionMetadata = {
+  sessionKind: SessionKind;
+  nativeThreadId: string | null;
+  parentNativeThreadId: string | null;
+  archiveVisible: boolean;
+};
+
+type ExistingCodexSession = CachedSummaryRecord & {
+  metadata_version?: number | null;
+  session_kind?: string | null;
+};
+
+const DEFAULT_CODEX_SESSION_METADATA: CodexSessionMetadata = {
+  sessionKind: "user",
+  nativeThreadId: null,
+  parentNativeThreadId: null,
+  archiveVisible: true,
+};
+
+function guardianSummaryMetadata(): SyncSummaryResult {
+  return {
+    title: "Codex Guardian 授权审查",
+    summary: "Codex App 为操作授权生成的内部审查会话。",
+    purpose: "内部授权审查",
+    target: "Codex Guardian",
+    outcome: "",
+    keywords: ["Codex", "Guardian", "授权审查"],
+    entities: [],
+    providerUsed: "rule",
+    status: "internal_guardian",
+    contentHash: "",
+    model: "",
+    promptVersion: 0,
+    fromCache: true,
+  };
+}
 
 export function codexSessionsDir(): string {
   return process.env.CODEX_SESSIONS_DIR ?? path.join(os.homedir(), ".codex", "sessions");
@@ -167,6 +212,32 @@ function projectFromRecord(record: Record<string, unknown>): string | null {
   return null;
 }
 
+function optionalString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+export function codexSessionMetadataFromRecord(record: Record<string, unknown>): CodexSessionMetadata | null {
+  if (String(record.type ?? "") !== "session_meta") return null;
+  const payload = record.payload;
+  if (!payload || typeof payload !== "object") return null;
+  const meta = payload as Record<string, unknown>;
+  const source = meta.source;
+  const sourceObject = source && typeof source === "object" ? (source as Record<string, unknown>) : null;
+  const subagent = sourceObject?.subagent;
+  const subagentObject = subagent && typeof subagent === "object" ? (subagent as Record<string, unknown>) : null;
+  const isGuardian = optionalString(subagentObject?.other)?.toLowerCase() === "guardian";
+  const isSubagent = isGuardian || String(meta.thread_source ?? "").toLowerCase() === "subagent" || Boolean(subagentObject);
+  const sessionKind: SessionKind = isGuardian ? "guardian" : isSubagent ? "subagent" : "user";
+  return {
+    sessionKind,
+    nativeThreadId: optionalString(meta.id) ?? optionalString(meta.session_id),
+    parentNativeThreadId: optionalString(meta.parent_thread_id),
+    archiveVisible: sessionKind !== "guardian",
+  };
+}
+
 function asUsageNumber(value: unknown): number {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim()) {
@@ -179,7 +250,8 @@ function asUsageNumber(value: unknown): number {
 function extractUsageRecords(
   record: Record<string, unknown>,
   fallback: Date,
-  project: string | null
+  project: string | null,
+  sourceOrdinal: string
 ): UsageInput[] {
   const lineType = String(record.type ?? "");
   if (lineType !== "event_msg") return [];
@@ -211,41 +283,57 @@ function extractUsageRecords(
       tool_tokens: 0,
       total_tokens: totalTokens,
       cost: null,
-      raw_ref: `codex:token_count:${ts}`,
+      raw_ref: `codex:token_count:${ts}:${sourceOrdinal}`,
     },
   ];
 }
 
-function parseFile(filePath: string, stat: fs.Stats): { project: string | null; messages: MessageRecord[]; usage: UsageInput[] } {
+function parseFile(filePath: string, stat: fs.Stats): {
+  project: string | null;
+  messages: MessageRecord[];
+  usage: UsageInput[];
+  sessionMetadata: CodexSessionMetadata;
+} {
   const raw = fs.readFileSync(filePath, "utf8");
   const lines = filePath.endsWith(".jsonl") ? raw.split(/\r?\n/).filter((l) => l.trim().length > 0) : [raw];
 
   const extracted: Array<{ role: ChatRole; ts: string; content: string }> = [];
   const usage: UsageInput[] = [];
   let project: string | null = null;
-  for (const line of lines) {
+  let sessionMetadata = DEFAULT_CODEX_SESSION_METADATA;
+  const appendMessage = (message: { role: ChatRole; ts: string; content: string } | null) => {
+    if (!message) return;
+    const content = cleanMessageContentForArchive(message.role, message.content);
+    if (!content.trim()) return;
+    extracted.push({ ...message, content });
+  };
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex]!;
     try {
       const parsed = JSON.parse(line) as unknown;
       if (Array.isArray(parsed)) {
-        for (const item of parsed) {
+        for (let itemIndex = 0; itemIndex < parsed.length; itemIndex += 1) {
+          const item = parsed[itemIndex];
           if (!project && item && typeof item === "object") {
             project = projectFromRecord(item as Record<string, unknown>) ?? project;
           }
           if (item && typeof item === "object") {
-            usage.push(...extractUsageRecords(item as Record<string, unknown>, stat.mtime, project));
+            const obj = item as Record<string, unknown>;
+            sessionMetadata = codexSessionMetadataFromRecord(obj) ?? sessionMetadata;
+            usage.push(...extractUsageRecords(obj, stat.mtime, project, `${lineIndex}:${itemIndex}`));
           }
-          const msg = extractMessage(item, stat.mtime);
-          if (msg) extracted.push(msg);
+          appendMessage(extractMessage(item, stat.mtime));
         }
       } else if (parsed && typeof parsed === "object") {
         const obj = parsed as Record<string, unknown>;
+        sessionMetadata = codexSessionMetadataFromRecord(obj) ?? sessionMetadata;
         if (!project) {
           project = projectFromRecord(obj) ?? project;
         }
-        usage.push(...extractUsageRecords(obj, stat.mtime, project));
+        usage.push(...extractUsageRecords(obj, stat.mtime, project, String(lineIndex)));
         const envelopeMessages = extractFromCodexEnvelope(obj, stat.mtime);
         if (envelopeMessages.length > 0) {
-          extracted.push(...envelopeMessages);
+          for (const message of envelopeMessages) appendMessage(message);
           continue;
         }
 
@@ -253,15 +341,13 @@ function parseFile(filePath: string, stat: fs.Stats): { project: string | null; 
           const list = (obj as { messages?: unknown }).messages;
           if (Array.isArray(list)) {
             for (const item of list) {
-              const msg = extractMessage(item, stat.mtime);
-              if (msg) extracted.push(msg);
+              appendMessage(extractMessage(item, stat.mtime));
             }
             continue;
           }
         }
 
-        const msg = extractMessage(parsed, stat.mtime);
-        if (msg) extracted.push(msg);
+        appendMessage(extractMessage(parsed, stat.mtime));
       } else {
         continue;
       }
@@ -303,7 +389,7 @@ function parseFile(filePath: string, stat: fs.Stats): { project: string | null; 
       seq_in_session: idx,
     };
   });
-  return { project, messages, usage: usage.map((item) => ({ ...item, project })) };
+  return { project, messages, usage: usage.map((item) => ({ ...item, project })), sessionMetadata };
 }
 
 export function syncCodexSessions(
@@ -344,7 +430,7 @@ export function syncCodexSessions(
   const getExistingSession = db.prepare(`
     SELECT title, summary, summary_provider, summary_status, session_purpose, session_target,
       session_outcome, keywords_json, entities_json, summary_content_hash, summary_model,
-      summary_prompt_version, end_time
+      summary_prompt_version, end_time, metadata_version, session_kind
     FROM sessions WHERE id = ?
   `);
   const upsertState = db.prepare(`
@@ -359,14 +445,17 @@ export function syncCodexSessions(
   const deleteSession = db.prepare("DELETE FROM sessions WHERE id = ?");
   const deleteMessages = db.prepare("DELETE FROM messages WHERE session_id = ?");
   const deleteFts = db.prepare("DELETE FROM message_fts WHERE session_id = ?");
+  const deleteUsageRecords = db.prepare("DELETE FROM usage_records WHERE session_id = ?");
+  const deleteUsageSummary = db.prepare("DELETE FROM session_usage_summary WHERE session_id = ?");
   const insertSession = db.prepare(`
     INSERT INTO sessions(
       id, tool, source_path, project, start_time, end_time, duration_sec,
       title, summary, summary_provider, summary_status, session_purpose, session_target,
       session_outcome, keywords_json, entities_json, metadata_version,
       summary_content_hash, summary_model, summary_prompt_version,
+      session_kind, native_thread_id, parent_native_thread_id, archive_visible,
       message_count, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertMessage = db.prepare(`
     INSERT INTO messages(id, session_id, role, ts, content, turn_index, seq_in_session)
@@ -382,14 +471,22 @@ export function syncCodexSessions(
     const project = parsed.project;
     const messages = parsed.messages;
     const usage = parsed.usage;
+    const sessionMetadata = parsed.sessionMetadata;
+    const storedMessages = sessionMetadata.archiveVisible ? messages : [];
+    const now = nowIso();
 
-    if (messages.length === 0) {
-      stats.warnings += 1;
-      stats.warningDetails.push(`[codex] empty messages: ${filePath}`);
+    if (messages.length === 0 && usage.length === 0) {
+      deleteFts.run(sessionId);
+      deleteMessages.run(sessionId);
+      deleteUsageRecords.run(sessionId);
+      deleteUsageSummary.run(sessionId);
+      const deleted = deleteSession.run(sessionId);
+      upsertState.run(filePath, Math.floor(stat.mtimeMs), stat.size, now);
+      if (deleted.changes > 0) stats.updatedSessions += 1;
       return;
     }
 
-    for (const msg of messages) {
+    for (const msg of storedMessages) {
       msg.session_id = sessionId;
     }
 
@@ -397,18 +494,19 @@ export function syncCodexSessions(
     const end = messages[messages.length - 1]?.ts ?? stat.mtime.toISOString();
     const durationSec = Math.max(0, Math.floor((new Date(end).valueOf() - new Date(start).valueOf()) / 1000));
     const allowCodex = settings.provider !== "hybrid" || codexBudget > 0;
-    const existing = getExistingSession.get(sessionId) as CachedSummaryRecord | undefined;
-    const metadata = buildSessionMetadataForSync(messages, existing, {
-      allowCodex,
-      startTime: start,
-      endTime: end,
-      forceSummaryRefresh,
-    });
+    const existing = getExistingSession.get(sessionId) as ExistingCodexSession | undefined;
+    const metadata =
+      sessionMetadata.sessionKind === "guardian"
+        ? guardianSummaryMetadata()
+        : buildSessionMetadataForSync(messages, existing, {
+            allowCodex,
+            startTime: start,
+            endTime: end,
+            forceSummaryRefresh,
+          });
     if (!metadata.fromCache && metadata.providerUsed === "codex" && settings.provider === "hybrid" && codexBudget > 0) {
       codexBudget -= 1;
     }
-    const now = nowIso();
-
     deleteFts.run(sessionId);
     deleteMessages.run(sessionId);
     deleteSession.run(sessionId);
@@ -433,16 +531,20 @@ export function syncCodexSessions(
       metadata.outcome,
       JSON.stringify(metadata.keywords),
       JSON.stringify(metadata.entities),
-      2,
+      CODEX_METADATA_VERSION,
       metadata.contentHash,
       metadata.model,
       metadata.promptVersion,
-      messages.length,
+      sessionMetadata.sessionKind,
+      sessionMetadata.nativeThreadId,
+      sessionMetadata.parentNativeThreadId,
+      sessionMetadata.archiveVisible ? 1 : 0,
+      storedMessages.length,
       now,
       now
     );
 
-    for (const msg of messages) {
+    for (const msg of storedMessages) {
       insertMessage.run(msg.id, msg.session_id, msg.role, msg.ts, msg.content, msg.turn_index, msg.seq_in_session);
       insertFts.run(msg.id, msg.session_id, msg.role, msg.content);
     }
@@ -468,8 +570,10 @@ export function syncCodexSessions(
     const state = getState.get(filePath) as { last_mtime_ms: number; last_size: number } | undefined;
     if (state && state.last_mtime_ms === Math.floor(stat.mtimeMs) && state.last_size === stat.size) {
       const sessionId = fileToSessionId(root, filePath);
-      const existing = getExistingSession.get(sessionId) as CachedSummaryRecord | undefined;
-      if (shouldRefreshUnchangedSummary(existing)) {
+      const existing = getExistingSession.get(sessionId) as ExistingCodexSession | undefined;
+      const needsMetadataUpgrade = Boolean(existing) && Number(existing?.metadata_version ?? 0) < CODEX_METADATA_VERSION;
+      const needsSummaryRefresh = existing?.session_kind !== "guardian" && shouldRefreshUnchangedSummary(existing);
+      if (needsMetadataUpgrade || needsSummaryRefresh) {
         try {
           tx(filePath, stat);
         } catch (error) {

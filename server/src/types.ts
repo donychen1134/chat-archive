@@ -1,4 +1,5 @@
 export type ChatRole = "user" | "assistant" | "tool" | "system";
+export type SessionKind = "user" | "guardian" | "subagent";
 
 export interface SessionRecord {
   id: string;
@@ -10,6 +11,10 @@ export interface SessionRecord {
   duration_sec: number;
   title: string;
   summary: string;
+  session_kind: SessionKind;
+  native_thread_id: string | null;
+  parent_native_thread_id: string | null;
+  archive_visible: number;
   message_count: number;
   created_at: string;
   updated_at: string;

@@ -34,6 +34,10 @@ export const BUILTIN_TARGET_NOISE = new Set([
   "catpaw",
   "agent-transcripts",
   "transcript",
+  "t3",
+  "userdata",
+  "scratch",
+  "statev2.sqlite",
 ]);
 
 export function looksLikeUuid(value: string): boolean {
@@ -66,8 +70,9 @@ export function isNoiseToken(value: string, extraNoise?: ReadonlySet<string>): b
   if (/^[a-z]{1,3}$/i.test(v)) return true;
   if (/^\d+$/.test(v)) return true;
   if (v.includes("#session:")) return true;
-  if (v.endsWith(".db")) return true;
-  if (v.includes(".db#")) return true;
+  if (v.includes("#thread:")) return true;
+  if (v.endsWith(".db") || v.endsWith(".sqlite")) return true;
+  if (v.includes(".db#") || v.includes(".sqlite#")) return true;
   if (v.startsWith(".") && !v.includes("-") && !v.includes("_")) return true;
   return false;
 }

@@ -5,10 +5,31 @@ import { oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 
 type Scope = "all" | "question" | "answer";
 type Role = "user" | "assistant" | "tool" | "system";
-type ToolFilter = "codex" | "claude" | "copilot" | "gemini" | "opencode" | "catpaw";
+type ToolFilter = "codex" | "claude" | "copilot" | "gemini" | "opencode" | "catpaw" | "t3";
 type ViewMode = "archive" | "usage";
 type SessionSortBy = "start_time" | "end_time";
-const ALL_TOOLS: ToolFilter[] = ["codex", "claude", "copilot", "gemini", "opencode", "catpaw"];
+const ALL_TOOLS: ToolFilter[] = ["codex", "claude", "copilot", "gemini", "opencode", "catpaw", "t3"];
+
+function formatToolLabel(tool: string): string {
+  switch (tool) {
+    case "claude":
+      return "Claude Code";
+    case "codex":
+      return "Codex";
+    case "copilot":
+      return "Copilot";
+    case "gemini":
+      return "Gemini";
+    case "opencode":
+      return "OpenCode";
+    case "catpaw":
+      return "CatPaw IDE";
+    case "t3":
+      return "T3 Code";
+    default:
+      return tool;
+  }
+}
 
 interface Session {
   id: string;
@@ -113,6 +134,12 @@ interface UsageOverviewResponse {
   totals: UsageOverview;
   recent: { total_tokens?: number | null; cost?: number | null };
   byTool: Array<{ tool: string; sessions: number; total_tokens: number; cost: number | null }>;
+  bySessionKind: Array<{
+    session_kind: "user" | "guardian" | "subagent" | string;
+    sessions: number;
+    total_tokens: number;
+    cost: number | null;
+  }>;
   coverage: { totalSessions: number; coveredSessions: number };
 }
 
@@ -245,7 +272,11 @@ function messageLooksBoilerplate(message: Message): boolean {
     text.startsWith("# skills") ||
     text.startsWith("<instructions>") ||
     text.includes("# agents.md instructions") ||
-    text.startsWith("<permissions instructions>")
+    text.startsWith("<permissions instructions>") ||
+    text.startsWith("<recommended_plugins>") ||
+    text.startsWith("<plugins_instructions>") ||
+    text.startsWith("<skills_instructions>") ||
+    text.startsWith("<app-context>")
   );
 }
 
@@ -1163,6 +1194,12 @@ export function App() {
             >
               CatPaw
             </button>
+            <button
+              className={`tool-chip ${selectedTools.includes("t3") ? "active" : ""}`}
+              onClick={(e) => toggleTool("t3", e.metaKey || e.ctrlKey || e.shiftKey)}
+            >
+              T3 Code
+            </button>
           </div>
           <div className="tool-filter-tip">单击单选，按 Cmd/Ctrl/Shift 可多选</div>
         </div>
@@ -1225,19 +1262,7 @@ export function App() {
                 <div className="title">{session.title}</div>
                 <div className="meta">
                   <span className={`tool-badge tool-${session.tool}`}>
-                    {session.tool === "claude"
-                      ? "Claude Code"
-                      : session.tool === "codex"
-                        ? "Codex"
-                        : session.tool === "copilot"
-                          ? "Copilot"
-                          : session.tool === "gemini"
-                            ? "Gemini"
-                            : session.tool === "opencode"
-                              ? "OpenCode"
-                              : session.tool === "catpaw"
-                                ? "CatPaw IDE"
-                            : session.tool}
+                    {formatToolLabel(session.tool)}
                   </span>
                   <span className="meta-side">
                     <span className="meta-questions">提问 {session.question_count ?? 0}</span>
@@ -1282,7 +1307,7 @@ export function App() {
             <section className="usage-dashboard">
               <div className="usage-hero">
                 <div className="usage-stat-card">
-                  <span className="usage-stat-label">总 Token</span>
+                  <span className="usage-stat-label">总 Token（含内部）</span>
                   <strong>{formatNumber(usageOverview?.totals.total_tokens)}</strong>
                 </div>
                 <div className="usage-stat-card">
@@ -1331,11 +1356,32 @@ export function App() {
                   <div className="usage-breakdown-list">
                     {(usageOverview?.byTool ?? []).map((item) => (
                       <div key={item.tool} className="usage-breakdown-row">
-                        <span className={`tool-badge tool-${item.tool}`}>{item.tool === "claude" ? "Claude Code" : item.tool === "opencode" ? "OpenCode" : item.tool === "catpaw" ? "CatPaw IDE" : item.tool}</span>
+                        <span className={`tool-badge tool-${item.tool}`}>{formatToolLabel(item.tool)}</span>
                         <strong>{formatNumber(item.total_tokens)}</strong>
                         <span>{item.sessions} 会话</span>
                       </div>
                     ))}
+                  </div>
+                  <div className="usage-breakdown-subhead">
+                    <strong>会话类型</strong>
+                    <span>区分用户对话与内部开销</span>
+                  </div>
+                  <div className="usage-breakdown-list">
+                    {(usageOverview?.bySessionKind ?? []).map((item) => {
+                      const label =
+                        item.session_kind === "guardian"
+                          ? "授权审查"
+                          : item.session_kind === "subagent"
+                            ? "子代理"
+                            : "用户会话";
+                      return (
+                        <div key={item.session_kind} className="usage-breakdown-row">
+                          <span>{label}</span>
+                          <strong>{formatNumber(item.total_tokens)}</strong>
+                          <span>{item.sessions} 会话</span>
+                        </div>
+                      );
+                    })}
                   </div>
                 </section>
               </div>
@@ -1349,7 +1395,7 @@ export function App() {
                   {usageSessions.map((item) => (
                     <button key={item.id} className="usage-session-row" onClick={() => { setViewMode("archive"); setSelected(item.id); }}>
                       <span className="usage-session-title">{item.title}</span>
-                      <span className={`tool-badge tool-${item.tool}`}>{item.tool === "claude" ? "Claude Code" : item.tool === "opencode" ? "OpenCode" : item.tool === "catpaw" ? "CatPaw IDE" : item.tool}</span>
+                      <span className={`tool-badge tool-${item.tool}`}>{formatToolLabel(item.tool)}</span>
                       <span>{formatNumber(item.usage_total_tokens)}</span>
                       <span className={`usage-status usage-${item.usage_status ?? "unavailable"}`}>{item.usage_status ?? "unavailable"}</span>
                     </button>
@@ -1366,19 +1412,7 @@ export function App() {
                 <section className="session-meta-card">
                   <div className="session-meta-row">
                     <span className={`tool-badge tool-${selectedSession.tool}`}>
-                      {selectedSession.tool === "claude"
-                        ? "Claude Code"
-                        : selectedSession.tool === "codex"
-                          ? "Codex"
-                          : selectedSession.tool === "copilot"
-                            ? "Copilot"
-                            : selectedSession.tool === "gemini"
-                              ? "Gemini"
-                              : selectedSession.tool === "opencode"
-                                ? "OpenCode"
-                                : selectedSession.tool === "catpaw"
-                                  ? "CatPaw IDE"
-                              : selectedSession.tool}
+                      {formatToolLabel(selectedSession.tool)}
                     </span>
                     <span className="meta-time">开始时间：{formatTime(selectedSession.start_time)}</span>
                     <span className="meta-time">最后更新：{formatTime(selectedSession.end_time)}</span>

@@ -6,6 +6,11 @@ const BLOCK_PATTERNS = [
   /<instructions>[\s\S]*?<\/instructions>/gi,
   /<environment_context>[\s\S]*?<\/environment_context>/gi,
   /<collaboration_mode>[\s\S]*?<\/collaboration_mode>/gi,
+  /<multi_agent_mode>[\s\S]*?<\/multi_agent_mode>/gi,
+  /<recommended_plugins>[\s\S]*?<\/recommended_plugins>/gi,
+  /<plugins_instructions>[\s\S]*?<\/plugins_instructions>/gi,
+  /<skills_instructions>[\s\S]*?<\/skills_instructions>/gi,
+  /<app-context>[\s\S]*?<\/app-context>/gi,
   /<cwd>[\s\S]*?<\/cwd>/gi,
   /<user_shell_command>[\s\S]*?<\/user_shell_command>/gi,
 ];
@@ -21,6 +26,11 @@ export function stripBoilerplateContent(text: string): string {
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+export function cleanMessageContentForArchive(role: MessageRecord["role"], text: string): string {
+  if (role !== "user" && role !== "assistant") return text.trimEnd();
+  return stripBoilerplateContent(text);
 }
 
 export function effectiveConversationMessages(messages: MessageRecord[]): MessageRecord[] {

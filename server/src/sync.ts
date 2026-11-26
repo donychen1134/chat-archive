@@ -4,156 +4,64 @@ import { countCopilotSessionFiles, syncCopilotSessions } from "./copilot-ingest.
 import { countGeminiSessionFiles, syncGeminiSessions } from "./gemini-ingest.js";
 import { countOpencodeSessionFiles, syncOpencodeSessions } from "./opencode-ingest.js";
 import { countCatpawSessionFiles, syncCatpawSessions } from "./catpaw-ingest.js";
+import { countT3SessionFiles, syncT3Sessions } from "./t3-ingest.js";
 import type { SyncProgress, SyncStats } from "./types.js";
 
+type SyncSource = {
+  count: () => number;
+  sync: (onProgress?: (progress: SyncProgress) => void) => SyncStats;
+};
+
+const SYNC_SOURCES: SyncSource[] = [
+  { count: countCodexSessionFiles, sync: syncCodexSessions },
+  { count: countClaudeSessionFiles, sync: syncClaudeSessions },
+  { count: countCopilotSessionFiles, sync: syncCopilotSessions },
+  { count: countGeminiSessionFiles, sync: syncGeminiSessions },
+  { count: countOpencodeSessionFiles, sync: syncOpencodeSessions },
+  { count: countCatpawSessionFiles, sync: syncCatpawSessions },
+  { count: countT3SessionFiles, sync: syncT3Sessions },
+];
+
 export function estimateTotalSourceFiles(): number {
-  return (
-    countCodexSessionFiles() +
-    countClaudeSessionFiles() +
-    countCopilotSessionFiles() +
-    countGeminiSessionFiles() +
-    countOpencodeSessionFiles() +
-    countCatpawSessionFiles()
-  );
+  return SYNC_SOURCES.reduce((sum, source) => sum + source.count(), 0);
 }
 
 export function syncAll(onProgress?: (progress: SyncProgress) => void): SyncStats {
   const totalFiles = estimateTotalSourceFiles();
-  const codexStats = syncCodexSessions((p) => {
-    if (!onProgress) return;
-    onProgress({ ...p, totalFiles });
-  });
-  const claudeStats = syncClaudeSessions((p) => {
-    if (!onProgress) return;
-    onProgress({
-      totalFiles,
-      processedFiles: codexStats.scannedFiles + p.processedFiles,
-      updatedSessions: codexStats.updatedSessions + p.updatedSessions,
-      skippedFiles: codexStats.skippedFiles + p.skippedFiles,
-      warnings: codexStats.warnings + p.warnings,
-      currentFile: p.currentFile,
-      warningDetails: [...codexStats.warningDetails, ...p.warningDetails].slice(-12),
-    });
-  });
-  const copilotStats = syncCopilotSessions((p) => {
-    if (!onProgress) return;
-    onProgress({
-      totalFiles,
-      processedFiles: codexStats.scannedFiles + claudeStats.scannedFiles + p.processedFiles,
-      updatedSessions: codexStats.updatedSessions + claudeStats.updatedSessions + p.updatedSessions,
-      skippedFiles: codexStats.skippedFiles + claudeStats.skippedFiles + p.skippedFiles,
-      warnings: codexStats.warnings + claudeStats.warnings + p.warnings,
-      currentFile: p.currentFile,
-      warningDetails: [...codexStats.warningDetails, ...claudeStats.warningDetails, ...p.warningDetails].slice(-12),
-    });
-  });
-  const geminiStats = syncGeminiSessions((p) => {
-    if (!onProgress) return;
-    onProgress({
-      totalFiles,
-      processedFiles: codexStats.scannedFiles + claudeStats.scannedFiles + copilotStats.scannedFiles + p.processedFiles,
-      updatedSessions: codexStats.updatedSessions + claudeStats.updatedSessions + copilotStats.updatedSessions + p.updatedSessions,
-      skippedFiles: codexStats.skippedFiles + claudeStats.skippedFiles + copilotStats.skippedFiles + p.skippedFiles,
-      warnings: codexStats.warnings + claudeStats.warnings + copilotStats.warnings + p.warnings,
-      currentFile: p.currentFile,
-      warningDetails: [...codexStats.warningDetails, ...claudeStats.warningDetails, ...copilotStats.warningDetails, ...p.warningDetails].slice(-12),
-    });
-  });
-  const opencodeStats = syncOpencodeSessions((p) => {
-    if (!onProgress) return;
-    onProgress({
-      totalFiles,
-      processedFiles:
-        codexStats.scannedFiles + claudeStats.scannedFiles + copilotStats.scannedFiles + geminiStats.scannedFiles + p.processedFiles,
-      updatedSessions:
-        codexStats.updatedSessions +
-        claudeStats.updatedSessions +
-        copilotStats.updatedSessions +
-        geminiStats.updatedSessions +
-        p.updatedSessions,
-      skippedFiles:
-        codexStats.skippedFiles + claudeStats.skippedFiles + copilotStats.skippedFiles + geminiStats.skippedFiles + p.skippedFiles,
-      warnings: codexStats.warnings + claudeStats.warnings + copilotStats.warnings + geminiStats.warnings + p.warnings,
-      currentFile: p.currentFile,
-      warningDetails: [
-        ...codexStats.warningDetails,
-        ...claudeStats.warningDetails,
-        ...copilotStats.warningDetails,
-        ...geminiStats.warningDetails,
-        ...p.warningDetails,
-      ].slice(-12),
-    });
-  });
-  const catpawStats = syncCatpawSessions((p) => {
-    if (!onProgress) return;
-    onProgress({
-      totalFiles,
-      processedFiles:
-        codexStats.scannedFiles +
-        claudeStats.scannedFiles +
-        copilotStats.scannedFiles +
-        geminiStats.scannedFiles +
-        opencodeStats.scannedFiles +
-        p.processedFiles,
-      updatedSessions:
-        codexStats.updatedSessions +
-        claudeStats.updatedSessions +
-        copilotStats.updatedSessions +
-        geminiStats.updatedSessions +
-        opencodeStats.updatedSessions +
-        p.updatedSessions,
-      skippedFiles:
-        codexStats.skippedFiles +
-        claudeStats.skippedFiles +
-        copilotStats.skippedFiles +
-        geminiStats.skippedFiles +
-        opencodeStats.skippedFiles +
-        p.skippedFiles,
-      warnings:
-        codexStats.warnings + claudeStats.warnings + copilotStats.warnings + geminiStats.warnings + opencodeStats.warnings + p.warnings,
-      currentFile: p.currentFile,
-      warningDetails: [
-        ...codexStats.warningDetails,
-        ...claudeStats.warningDetails,
-        ...copilotStats.warningDetails,
-        ...geminiStats.warningDetails,
-        ...opencodeStats.warningDetails,
-        ...p.warningDetails,
-      ].slice(-12),
-    });
-  });
-
-  return {
-    scannedFiles:
-      codexStats.scannedFiles +
-      claudeStats.scannedFiles +
-      copilotStats.scannedFiles +
-      geminiStats.scannedFiles +
-      opencodeStats.scannedFiles +
-      catpawStats.scannedFiles,
-    updatedSessions:
-      codexStats.updatedSessions +
-      claudeStats.updatedSessions +
-      copilotStats.updatedSessions +
-      geminiStats.updatedSessions +
-      opencodeStats.updatedSessions +
-      catpawStats.updatedSessions,
-    skippedFiles:
-      codexStats.skippedFiles +
-      claudeStats.skippedFiles +
-      copilotStats.skippedFiles +
-      geminiStats.skippedFiles +
-      opencodeStats.skippedFiles +
-      catpawStats.skippedFiles,
-    warnings:
-      codexStats.warnings + claudeStats.warnings + copilotStats.warnings + geminiStats.warnings + opencodeStats.warnings + catpawStats.warnings,
-    warningDetails: [
-      ...codexStats.warningDetails,
-      ...claudeStats.warningDetails,
-      ...copilotStats.warningDetails,
-      ...geminiStats.warningDetails,
-      ...opencodeStats.warningDetails,
-      ...catpawStats.warningDetails,
-    ].slice(-20),
+  const aggregate: SyncStats = {
+    scannedFiles: 0,
+    updatedSessions: 0,
+    skippedFiles: 0,
+    warnings: 0,
+    warningDetails: [],
   };
+
+  for (const source of SYNC_SOURCES) {
+    const baseScanned = aggregate.scannedFiles;
+    const baseUpdated = aggregate.updatedSessions;
+    const baseSkipped = aggregate.skippedFiles;
+    const baseWarnings = aggregate.warnings;
+    const baseDetails = aggregate.warningDetails;
+
+    const stats = source.sync((p) => {
+      if (!onProgress) return;
+      onProgress({
+        totalFiles,
+        processedFiles: baseScanned + p.processedFiles,
+        updatedSessions: baseUpdated + p.updatedSessions,
+        skippedFiles: baseSkipped + p.skippedFiles,
+        warnings: baseWarnings + p.warnings,
+        currentFile: p.currentFile,
+        warningDetails: [...baseDetails, ...p.warningDetails].slice(-12),
+      });
+    });
+
+    aggregate.scannedFiles += stats.scannedFiles;
+    aggregate.updatedSessions += stats.updatedSessions;
+    aggregate.skippedFiles += stats.skippedFiles;
+    aggregate.warnings += stats.warnings;
+    aggregate.warningDetails = [...aggregate.warningDetails, ...stats.warningDetails].slice(-20);
+  }
+
+  return aggregate;
 }

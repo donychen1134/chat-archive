@@ -171,6 +171,26 @@ try {
 } catch {
   // Column may already exist.
 }
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'user'`);
+} catch {
+  // Column may already exist.
+}
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN native_thread_id TEXT`);
+} catch {
+  // Column may already exist.
+}
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN parent_native_thread_id TEXT`);
+} catch {
+  // Column may already exist.
+}
+try {
+  db.exec(`ALTER TABLE sessions ADD COLUMN archive_visible INTEGER NOT NULL DEFAULT 1`);
+} catch {
+  // Column may already exist.
+}
 
 db.exec(`
 CREATE INDEX IF NOT EXISTS idx_usage_records_session_id ON usage_records(session_id);
@@ -183,6 +203,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON sessions(start_time DESC, 
 CREATE INDEX IF NOT EXISTS idx_sessions_end_time ON sessions(end_time DESC, start_time DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_tool_start_time ON sessions(tool, start_time DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_tool_end_time ON sessions(tool, end_time DESC, start_time DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_archive_kind_start ON sessions(archive_visible, session_kind, start_time DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_native_thread ON sessions(native_thread_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_parent_native_thread ON sessions(parent_native_thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session_role ON messages(session_id, role);
 CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq_in_session);
 `);
